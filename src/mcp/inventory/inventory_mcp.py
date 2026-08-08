@@ -288,16 +288,21 @@ class InventoryMCP:
 
     async def get_low_stock_items(self, store_id: str) -> list[LowStockItem]:
         """Return all items at or below their reorder level."""
+        # Fetch all rows for this store — column-to-column comparison
+        # (.lte("quantity_in_stock", "reorder_level") passes "reorder_level" as a
+        # literal string value, causing a DB type error). Filter in Python instead.
         resp = (
             self.db.schema("inventory")
             .table("inventory")
             .select("product_id, quantity_in_stock, reorder_level")
             .eq("store_id", store_id)
-            .lte("quantity_in_stock", "reorder_level")
             .order("quantity_in_stock")
             .execute()
         )
-        inv_rows = resp.data or []
+        inv_rows = [
+            r for r in (resp.data or [])
+            if float(r["quantity_in_stock"]) <= float(r["reorder_level"])
+        ]
 
         # Batch-fetch all product metadata in one query (avoid N+1)
         product_ids = [r["product_id"] for r in inv_rows]
@@ -382,26 +387,33 @@ class InventoryMCP:
             .order("quantity_in_stock")
             .execute()
         )
-        results = []
-        for row in resp.data or []:
-            prod_r = (
+        inv_rows = resp.data or []
+
+        # Batch-fetch product metadata in one query (avoids N+1)
+        product_ids = [r["product_id"] for r in inv_rows]
+        prod_map: dict = {}
+        if product_ids:
+            prod_resp = (
                 self.db.schema("catalogue")
                 .table("products")
-                .select("name, brand, unit")
-                .eq("id", row["product_id"])
-                .limit(1)
+                .select("id, name, brand, unit")
+                .in_("id", product_ids)
                 .execute()
             )
-            prod = _one(prod_r) or {}
+            prod_map = {r["id"]: r for r in (prod_resp.data or [])}
+
+        results = []
+        for row in inv_rows:
+            prod = prod_map.get(row["product_id"], {})
             qty = float(row["quantity_in_stock"])
             reorder = float(row["reorder_level"])
             results.append(
                 StockResult(
                     product_id=row["product_id"],
-                    product_name=prod["name"],
+                    product_name=prod.get("name", ""),
                     brand=prod.get("brand"),
                     quantity_in_stock=qty,
-                    unit=prod["unit"],
+                    unit=prod.get("unit", ""),
                     reorder_level=reorder,
                     is_below_reorder=qty <= reorder,
                     last_restocked_at=row.get("last_restocked_at"),

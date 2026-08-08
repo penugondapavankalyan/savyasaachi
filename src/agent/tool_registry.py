@@ -910,7 +910,15 @@ def _build_active_tools(
             is_credit=is_credit,
             customer_id=customer_id,
         )
-        return str(result)
+        # Put bill_id on the FIRST line so the LLM can reliably read it back
+        # for confirm_payment / cancel_bill / void_bill in the next turn.
+        return (
+            f"bill_id={result.bill_id}\n"
+            f"bill_number={result.bill_number}\n"
+            f"status=PENDING_PAYMENT\n"
+            f"total=₹{result.total_amount:.2f} | payment_mode={result.payment_mode}\n"
+            f"{result.message}"
+        )
 
     async def cancel_draft_bill() -> str:
         """Cancel the current active bill draft (discard all items).
@@ -1126,8 +1134,9 @@ INTENT_KEYWORDS: dict[str, list[str]] = {
     ],
     "INVENTORY":  [
         "stock", "inventory", "restock", "low stock", "out of stock",
-        "stock movement", "received stock", "add stock", "how much stock",
-        "units left", "units available", "in stock",
+        "stock movement", "stock history", "movement history", "received stock",
+        "add stock", "how much stock", "units left", "units available", "in stock",
+        "full report", "all stock", "stock report",
     ],
     "KHATA":      [
         # NOTE: "credit" is intentionally EXCLUDED here.
