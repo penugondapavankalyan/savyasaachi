@@ -152,7 +152,13 @@ class KiranaAgent:
         # Pass has_active_draft so payment-mode words ("credit", "cash", "upi")
         # during an active billing session always route to BILLING, not KHATA.
         has_active_draft = bool(store_context.active_draft_bill_id)
-        intent = detect_intent(user_message, has_active_draft=has_active_draft)
+        # Pass last assistant message so detect_intent can infer intent from
+        # conversational context (e.g. follow-up product name after "which product?")
+        last_assistant_msg = next(
+            (m["content"] for m in reversed(conversation_history) if m.get("role") == "assistant"),
+            None,
+        )
+        intent = detect_intent(user_message, has_active_draft=has_active_draft, last_assistant_msg=last_assistant_msg)
         # Context is passed so that context-bound wrappers can bake in
         # telegram_user_id and store_id — the LLM never sees those IDs.
         tools = get_tools_for_state(store_context.workflow_state, self.mcps, store_context, intent)

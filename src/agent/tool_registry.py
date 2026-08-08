@@ -460,6 +460,32 @@ def _build_active_tools(
     # would still read None from their captured snapshot, causing "No active draft bill" errors.
     _draft_id_cell: list[str | None] = [context.active_draft_bill_id if context else None]
 
+    # _bill_id_cell holds the UUID of the most recent PENDING_PAYMENT bill for this store.
+    # confirm_payment / cancel_bill read from here — the LLM never passes bill_id.
+    # Initialized by querying the DB for the latest PENDING_PAYMENT bill (handles the case
+    # where the owner sends "paid" in a fresh turn after finalize_bill completed last turn).
+    # finalize_bill() also writes into this cell when it creates a new bill in this turn.
+    # void_bill does its own CONFIRMED lookup — _bill_id_cell is cleared after confirm_payment.
+    _pending_bill_id: str | None = None
+    if store_id:
+        try:
+            _pb_resp = (
+                mcps.billing.db.schema("billing")
+                .table("bills")
+                .select("id")
+                .eq("store_id", store_id)
+                .eq("status", "PENDING_PAYMENT")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            _pb_rows = _pb_resp.data or []
+            if _pb_rows:
+                _pending_bill_id = _pb_rows[0]["id"]
+        except Exception:
+            pass
+    _bill_id_cell: list[str | None] = [_pending_bill_id]
+
     # ── Shared lookup tools (all intents) ───────────────────────────────
 
     async def search_products(query: str) -> str:
@@ -910,10 +936,10 @@ def _build_active_tools(
             is_credit=is_credit,
             customer_id=customer_id,
         )
-        # Put bill_id on the FIRST line so the LLM can reliably read it back
-        # for confirm_payment / cancel_bill / void_bill in the next turn.
+        # Store bill_id so confirm_payment/cancel_bill/void_bill can resolve it
+        # automatically — the LLM never needs to pass it.
+        _bill_id_cell[0] = result.bill_id
         return (
-            f"bill_id={result.bill_id}\n"
             f"bill_number={result.bill_number}\n"
             f"status=PENDING_PAYMENT\n"
             f"total=₹{result.total_amount:.2f} | payment_mode={result.payment_mode}\n"
@@ -939,50 +965,65 @@ def _build_active_tools(
         result = await mcps.billing.get_bill(bill_id=bill_id)
         return str(result)
 
-    async def confirm_payment(bill_id: str) -> str:
+    async def confirm_payment() -> str:
         """
-        Confirm that payment was received for a bill in PENDING_PAYMENT status.
-        Call this after:
-          - Cash is handed over and counted
-          - UPI transfer is received/confirmed
-          - Credit terms are accepted (for CREDIT payment mode)
-        This moves the bill from PENDING_PAYMENT → CONFIRMED.
-        - bill_id: from the finalize_bill result
+        Confirm that payment was received for the current PENDING_PAYMENT bill.
+        Call this after cash is handed over, UPI transfer received, or credit accepted.
+        Moves the bill from PENDING_PAYMENT → CONFIRMED.
+        Do NOT pass bill_id — resolved automatically from the server.
         """
-        from src.utils.guardrails import clean_uuid
-        if not clean_uuid(bill_id):
-            return f"ERROR: '{bill_id}' is not a valid bill_id."
-        result = await mcps.billing.confirm_payment(bill_id=bill_id)
+        resolved_bill_id = _bill_id_cell[0]
+        if not resolved_bill_id:
+            return "ERROR: No PENDING_PAYMENT bill found. Nothing to confirm."
+        result = await mcps.billing.confirm_payment(bill_id=resolved_bill_id)
+        if result.success:
+            _bill_id_cell[0] = None  # clear after confirmed
         return result.message
 
-    async def cancel_bill(bill_id: str) -> str:
+    async def cancel_bill() -> str:
         """
-        Cancel a bill that is in PENDING_PAYMENT status (before payment is confirmed).
-        This restores all stock back to inventory and reverses any khata entry.
-        Use this when owner says 'cancel', 'wrong items', 'start over' AFTER finalize_bill
+        Cancel the current PENDING_PAYMENT bill (before payment is confirmed).
+        Restores all stock back to inventory and reverses any khata entry.
+        Use when owner says 'cancel', 'wrong items', or 'start over' AFTER finalize_bill
         but BEFORE confirm_payment.
-        - bill_id: from the finalize_bill result
+        Do NOT pass bill_id — resolved automatically from the server.
         DO NOT use this on CONFIRMED bills — use void_bill instead.
-        DO NOT use cancel_draft_bill — that is for OPEN drafts only.
         """
-        from src.utils.guardrails import clean_uuid
-        if not clean_uuid(bill_id):
-            return f"ERROR: '{bill_id}' is not a valid bill_id."
-        result = await mcps.billing.cancel_bill(bill_id=bill_id)
+        resolved_bill_id = _bill_id_cell[0]
+        if not resolved_bill_id:
+            return "ERROR: No PENDING_PAYMENT bill found. Nothing to cancel."
+        result = await mcps.billing.cancel_bill(bill_id=resolved_bill_id)
+        if result.success:
+            _bill_id_cell[0] = None
         return result.message
 
-    async def void_bill(bill_id: str) -> str:
+    async def void_bill() -> str:
         """
-        Void a CONFIRMED bill — full reversal after payment was already confirmed.
-        This restores all stock and reverses the payment/khata entry.
-        Use this when owner says 'cancel', 'undo', or 'wrong' AFTER confirm_payment.
-        - bill_id: from the finalize_bill or get_bill result
+        Void the most recently CONFIRMED bill — full reversal after payment was confirmed.
+        Restores all stock and reverses the payment/khata entry.
+        Use when owner says 'cancel', 'undo', or 'wrong' AFTER confirm_payment.
+        Do NOT pass bill_id — resolved automatically from the server.
         DO NOT use this on PENDING_PAYMENT bills — use cancel_bill instead.
         """
-        from src.utils.guardrails import clean_uuid
-        if not clean_uuid(bill_id):
-            return f"ERROR: '{bill_id}' is not a valid bill_id."
-        result = await mcps.billing.void_bill(bill_id=bill_id)
+        # void targets the most recent CONFIRMED bill for this store
+        try:
+            _vb_resp = (
+                mcps.billing.db.schema("billing")
+                .table("bills")
+                .select("id")
+                .eq("store_id", store_id)
+                .eq("status", "CONFIRMED")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            _vb_rows = _vb_resp.data or []
+            resolved_bill_id = _vb_rows[0]["id"] if _vb_rows else None
+        except Exception:
+            resolved_bill_id = None
+        if not resolved_bill_id:
+            return "ERROR: No CONFIRMED bill found to void."
+        result = await mcps.billing.void_bill(bill_id=resolved_bill_id)
         return result.message
 
     async def add_customer(name: str, phone: str) -> str:
@@ -1014,7 +1055,11 @@ def _build_active_tools(
         Record that the shop gave goods ON CREDIT — customer OWES the shop (amount_delta = +positive).
         Use ONLY for standalone credit advances, NOT during a billing session (finalize_bill handles that).
         DO NOT use this for overpayments — use add_payment_entry for any money received from the customer.
+        customer_id MUST be a valid UUID from get_customer/add_customer — do NOT pass placeholder strings like 'WALK_IN_CUSTOMER'.
         """
+        from src.utils.guardrails import clean_uuid
+        if not clean_uuid(customer_id):
+            return "ERROR: customer_id must be a valid UUID. Do not pass 'WALK_IN_CUSTOMER'."
         result = await mcps.khata.add_credit_entry(
             store_id=store_id, customer_id=customer_id,
             amount=amount, notes=notes
@@ -1029,7 +1074,11 @@ def _build_active_tools(
           - Customer OVERPAYS a cash/UPI bill and the extra should be stored for future use
             (e.g. bill was ₹202.85, customer paid ₹220, extra ₹17.15 → add_payment_entry(amount=17.15))
         The balance will be negative if the shop now owes the customer.
+        customer_id MUST be a valid UUID from get_customer/add_customer — do NOT pass placeholder strings like 'WALK_IN_CUSTOMER'.
         """
+        from src.utils.guardrails import clean_uuid
+        if not clean_uuid(customer_id):
+            return "ERROR: customer_id must be a valid UUID. Do not pass 'WALK_IN_CUSTOMER'. To confirm a bill payment, call confirm_payment() instead."
         result = await mcps.khata.add_payment_entry(
             store_id=store_id, customer_id=customer_id,
             amount=amount, notes=notes
@@ -1077,13 +1126,15 @@ def _build_active_tools(
         return result.message
 
     # ── BILLING_CONFIRM intent — post-finalize tools (no active draft) ────────
-    # Only confirm_payment, cancel_bill, void_bill are needed here.
-    # Shown when no draft is open but owner needs to confirm/cancel/void a bill.
+    # confirm_payment / cancel_bill / void_bill for bill lifecycle.
+    # add_customer / get_customer / add_payment_entry for overpayment handling
+    # (owner paid more than bill total → confirm first, then save extra to khata).
     if intent == "BILLING_CONFIRM":
         return [
             search_products,
             confirm_payment, cancel_bill, void_bill,
             get_bill,
+            add_customer, get_customer, add_payment_entry,
         ]
 
     # ── BILLING (default) — draft-building tools ──────────────────────────────
@@ -1126,6 +1177,8 @@ INTENT_KEYWORDS: dict[str, list[str]] = {
         "confirm payment", "confirm the payment", "payment confirmed", "payment done",
         "void bill", "void the bill", "cancel bill", "cancel the bill",
         "undo bill", "reverse bill", "payment received",
+        # "paid <amount>" after finalize means payment confirmation, not a khata entry.
+        "paid", "yes paid", "payment done",
     ],
     "CATALOGUE":  [
         "catalogue", "add product", "add item", "new product", "new item",
@@ -1134,8 +1187,10 @@ INTENT_KEYWORDS: dict[str, list[str]] = {
     ],
     "INVENTORY":  [
         "stock", "inventory", "restock", "low stock", "out of stock",
-        "stock movement", "stock history", "movement history", "received stock",
-        "add stock", "how much stock", "units left", "units available", "in stock",
+        "stock movement", "stock history", "movement history",
+        "track movement", "track movements", "movements",
+        "received stock", "add stock", "how much stock",
+        "units left", "units available", "in stock",
         "full report", "all stock", "stock report",
     ],
     "KHATA":      [
@@ -1167,7 +1222,29 @@ _BILLING_PAYMENT_WORDS = frozenset({
 _PAID_PATTERN = _re.compile(r"\bpaid\b.*?\d|[\w]+ paid\b", _re.IGNORECASE)
 
 
-def detect_intent(user_message: str, has_active_draft: bool = False) -> str:
+# Phrases the agent uses when asking the owner to name a product for an inventory action.
+# If the previous assistant turn contained any of these, a bare product-name follow-up
+# should stay in INVENTORY rather than falling back to BILLING.
+_INVENTORY_FOLLOWUP_PHRASES = (
+    "stock history",
+    "movement history",
+    "track movement",
+    "which product",
+    "product name",
+    "which item",
+    "name of the item",
+    "product would you like",
+    "item would you like",
+    "see the stock",
+    "check stock for",
+)
+
+
+def detect_intent(
+    user_message: str,
+    has_active_draft: bool = False,
+    last_assistant_msg: str | None = None,
+) -> str:
     """
     Lightweight keyword-based intent detector.
     Falls back to BILLING (the most common daily task).
@@ -1178,8 +1255,20 @@ def detect_intent(user_message: str, has_active_draft: bool = False) -> str:
 
     BILLING_CONFIRM is only reachable when no draft is active — it handles
     confirm_payment / cancel_bill / void_bill after finalize_bill is done.
+
+    last_assistant_msg: when provided, used to keep follow-up single-word
+    replies in the same intent as the previous turn (e.g. product name
+    after "which product would you like to check?").
     """
     msg = user_message.lower()
+
+    # Context-aware: if the previous assistant turn was asking for a product name
+    # in an INVENTORY context, treat the follow-up as INVENTORY regardless of
+    # whether the user's reply contains any INVENTORY keywords.
+    if last_assistant_msg:
+        last_lower = last_assistant_msg.lower()
+        if any(p in last_lower for p in _INVENTORY_FOLLOWUP_PHRASES):
+            return "INVENTORY"
 
     # If a draft bill is active, payment-mode words mean "pay this bill" →
     # always BILLING, not KHATA or BILLING_CONFIRM.
@@ -1193,8 +1282,12 @@ def detect_intent(user_message: str, has_active_draft: bool = False) -> str:
             if kw in msg:
                 return "BILLING_CONFIRM"
 
-    # Special pattern: "X paid <number>" or "X paid" → payment in khata
-    if _PAID_PATTERN.search(user_message):
+    # Special pattern: "X paid <number>" or "X paid" → payment in khata.
+    # BUT: when there is NO active draft, a "paid" message most likely means
+    # the owner is confirming payment for the last finalized bill (PENDING_PAYMENT).
+    # Only route to KHATA when a draft IS active (standalone khata entry mid-session)
+    # or when the message also matches a KHATA keyword (e.g. customer name context).
+    if _PAID_PATTERN.search(user_message) and has_active_draft:
         return "KHATA"
 
     for intent, keywords in INTENT_KEYWORDS.items():
