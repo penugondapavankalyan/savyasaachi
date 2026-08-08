@@ -1,215 +1,96 @@
 """
-Dynamic system prompt builder.
+system_prompt.py — Generates the system prompt for the Kirana Store Agent.
 
-IMPORTANT: The LLM must NEVER pass telegram_user_id or store_id to tools.
-Those values are baked into every tool function server-side (context-bound
-wrappers in tool_registry.py). The LLM only passes domain-relevant
-arguments: names, prices, quantities, product names, etc.
+The system prompt is dynamically assembled per request based on the store's
+current state (workflow_state, store profile, active bill status, etc.).
+It contains all business rules, tool instructions, and guardrails the LLM must follow.
 """
 
 from __future__ import annotations
 
-from datetime import date
+import json
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
-from src.agent.config import StoreContext
+if TYPE_CHECKING:
+    from src.agent.context_loader import StoreContext
 
-# ISO 3166-2:IN state code → state name
+# State code mapping for Indian states
 STATE_CODE_TO_NAME: dict[str, str] = {
-    "01": "Jammu & Kashmir",
-    "02": "Himachal Pradesh",
-    "03": "Punjab",
-    "04": "Chandigarh",
-    "05": "Uttarakhand",
-    "06": "Haryana",
-    "07": "Delhi",
-    "08": "Rajasthan",
-    "09": "Uttar Pradesh",
-    "10": "Bihar",
-    "18": "Assam",
-    "19": "West Bengal",
-    "20": "Jharkhand",
-    "21": "Odisha",
-    "22": "Chhattisgarh",
-    "23": "Madhya Pradesh",
-    "24": "Gujarat",
-    "27": "Maharashtra",
-    "29": "Karnataka",
-    "30": "Goa",
-    "32": "Kerala",
-    "33": "Tamil Nadu",
-    "36": "Telangana",
-    "37": "Andhra Pradesh",
+    "01": "Jammu & Kashmir", "02": "Himachal Pradesh", "03": "Punjab",
+    "04": "Chandigarh", "05": "Uttarakhand", "06": "Haryana", "07": "Delhi",
+    "08": "Rajasthan", "09": "Uttar Pradesh", "10": "Bihar", "11": "Sikkim",
+    "12": "Arunachal Pradesh", "13": "Nagaland", "14": "Manipur", "15": "Mizoram",
+    "16": "Tripura", "17": "Meghalaya", "18": "Assam", "19": "West Bengal",
+    "20": "Jharkhand", "21": "Odisha", "22": "Chhattisgarh", "23": "Madhya Pradesh",
+    "24": "Gujarat", "27": "Maharashtra", "29": "Karnataka", "30": "Goa",
+    "31": "Lakshadweep", "32": "Kerala", "33": "Tamil Nadu", "34": "Puducherry",
+    "35": "Andaman & Nicobar Islands", "36": "Telangana", "37": "Andhra Pradesh",
+    "38": "Ladakh",
 }
-
-# State code → name map for guiding the LLM
-_STATE_LIST = "\n".join(
-    f"    {code} = {name}" for code, name in sorted(STATE_CODE_TO_NAME.items())
-)
-
-
-def _build_unregistered_guidance(context: StoreContext) -> str:
-    """
-    Full registration flow. Phone is MANDATORY. GSTIN uses exact skip message.
-    """
-    owner_name = context.owner_first_name
-
-    if not owner_name:
-        return (
-            "REGISTRATION — Collect owner details step by step.\n"
-            "\n"
-            "Step 1: Greet warmly. Ask: 'Welcome! What is your name?'\n"
-            "Step 2: Call save_owner_name(first_name='<name>').\n"
-            "Step 3: Ask: 'What is the name of your shop?'\n"
-            "Step 4: Ask: 'What is the phone number of your shop?' (MANDATORY)\n"
-            "        - Must be a valid number. Keep asking until a valid number is given.\n"
-            "        - Do NOT proceed without a valid phone number.\n"
-            "Step 5: Ask: 'What is your shop address?' (optional — owner can skip)\n"
-            "Step 6: Ask: 'Which state is your shop in?'\n"
-            f"        Valid state codes:\n{_STATE_LIST}\n"
-            "        Ask for the state name and convert to the 2-digit state code.\n"
-            "Step 7: Ask exactly this: 'Please share your GSTIN (if you don't want to share please type skip)'\n"
-            "        - If owner types their GSTIN: pass it as gstin='<value>'\n"
-            "        - If owner types 'skip' or similar: pass gstin=None\n"
-            "Step 8: Ask: 'What is your default payment mode? (CASH / UPI / CREDIT)' (default CASH)\n"
-            "Step 9: Show a summary and confirm:\n"
-            "        'Here are your shop details:\n"
-            "          Shop Name    : <name>\n"
-            "          Phone        : <phone>\n"
-            "          Address      : <address or not provided>\n"
-            "          State        : <state name> (<state code>)\n"
-            "          GSTIN        : <gstin or not provided>\n"
-            "          Payment Mode : <mode>\n"
-            "         Is this correct? (yes/no)'\n"
-            "Step 10: If yes → call setup_store(shop_name, phone, state_code, gstin, address, default_payment_mode)\n"
-            "         If no → ask which field to fix, update it, show summary again.\n"
-            "\n"
-            "Do NOT call setup_store without phone and state_code.\n"
-            "Do NOT pass any user ID or store ID — automatic."
-        )
-    else:
-        return (
-            f"REGISTRATION — Owner name known: {owner_name}.\n"
-            "\n"
-            "Step 1: Ask: 'What is the name of your shop?'\n"
-            "Step 2: Ask: 'What is the phone number of your shop?' (MANDATORY)\n"
-            "        - Must be a valid number. Keep asking until valid.\n"
-            "Step 3: Ask: 'What is your shop address?' (optional — owner can skip)\n"
-            "Step 4: Ask: 'Which state is your shop in?'\n"
-            f"        Valid state codes:\n{_STATE_LIST}\n"
-            "        Ask for the state name and convert to the 2-digit state code.\n"
-            "Step 5: Ask exactly this: 'Please share your GSTIN (if you don't want to share please type skip)'\n"
-            "        - If owner gives GSTIN: pass as gstin='<value>'\n"
-            "        - If owner types 'skip': pass gstin=None\n"
-            "Step 6: Ask: 'What is your default payment mode? (CASH / UPI / CREDIT)' (default CASH)\n"
-            "Step 7: Show summary and confirm before calling setup_store.\n"
-            "        'Shop Name : <name> | Phone: <phone> | State: <state> | GSTIN: <gstin or none> | Payment: <mode>'\n"
-            "        Is this correct? (yes/no)\n"
-            "Step 8: If yes → call setup_store(shop_name, phone, state_code, gstin, address, default_payment_mode)\n"
-            "\n"
-            "Do NOT call setup_store without phone and state_code.\n"
-            "Do NOT pass any user ID or store ID — automatic."
-        )
-
-
-def _build_pending_catalogue_guidance(context: StoreContext) -> str:
-    owner_name = context.owner_first_name or "Owner"
-
-    return (
-        f"CATALOGUE SETUP — Store '{context.shop_name}' is registered.\n"
-        f"Help {owner_name} add products to the catalogue.\n"
-        f"\n"
-        f"STEP-BY-STEP — ask ONE question at a time:\n"
-        f"  1. 'What is the product name?'\n"
-        f"  2. 'Is it loose or branded?'\n"
-        f"     - Loose = sold by weight/volume, no brand (sugar, rice, dal)\n"
-        f"     - Branded = packaged with brand name (Tata Salt, Amul Milk)\n"
-        f"  3. If BRANDED: 'What is the brand name?' | If LOOSE: skip (brand=None)\n"
-        f"  4. 'What unit?' — must be one of: KG / G / L / ML / PACKET / PIECE / DOZEN / BUNDLE\n"
-        f"     (If owner says 'pack', 'pkt', 'nos', 'bottle', etc. — convert to canonical unit yourself)\n"
-        f"  5. 'What is your cost price? (what you paid, in Rs.)'\n"
-        f"  6. 'What is the MRP / selling price? (in Rs.)'\n"
-        f"  7. 'What is the reorder level? (minimum stock before alert)'\n"
-        f"  8. GST rate:\n"
-        f"     - LOOSE item → gst_rate = 0. Skip asking. Do NOT ask the owner.\n"
-        f"     - BRANDED item → MANDATORY. Ask: 'What is the GST rate? (5 / 12 / 18 / 28 %)'\n"
-        f"       NEVER assume 0% for branded. NEVER call add_product without the GST rate for branded items.\n"
-        f"  9. 'Do you have the HSN code? (optional — skip if not known)'\n"
-        f"\n"
-        f"MANDATORY CONFIRMATION before calling add_product:\n"
-        f"  Show summary and ask 'Is this correct? (yes/no)':\n"
-        f"    Name: <name> | Type: Loose/Branded | Brand: <brand> | Unit: <unit>\n"
-        f"    Cost: Rs.<cost> | MRP: Rs.<mrp> | GST: <rate>% | Reorder at: <level> <unit> | HSN: <hsn>\n"
-        f"  If YES: call add_product. If NO: fix the field, show summary again.\n"
-        f"  NEVER call add_product without confirmation.\n"
-        f"\n"
-        f"AFTER add_product:\n"
-        f"  - Show success message.\n"
-        f"  - Ask: 'Would you like to add another product?'\n"
-        f"  - If yes: repeat from step 1.\n"
-        f"  - If no: say 'Great! You MUST now add stock to inventory before billing is available.'\n"
-        f"    Then call list_products() to show what is in the catalogue.\n"
-        f"\n"
-        f"BILLING IS NOT AVAILABLE in this state. If owner asks to make a bill:\n"
-        f"  Say: 'You need to add stock to your inventory first. Please use the inventory setup.'\n"
-        f"\n"
-        f"EDITING: use update_product_details(product_id, ...) to change any product field.\n"
-        f"  - Use list_products() to get the full product_id first.\n"
-        f"  - product_id must be the FULL UUID (e.g. 619d392d-xxxx-xxxx-xxxx-xxxxxxxxxxxx)\n"
-        f"STORE UPDATES: use update_store(...) to change shop name, phone, address, state, payment mode.\n"
-        f"OWNER NAME: use update_owner_name(...) to change first_name or last_name."
-    )
 
 
 def build_system_prompt(context: StoreContext) -> str:
-    """Return the system prompt string for this invocation."""
-    state_name = STATE_CODE_TO_NAME.get(context.state_code, context.state_code)
-    today = date.today().strftime("%A, %d %B %Y")
-    owner_name = context.owner_first_name or "Owner"
+    """Build the complete system prompt string tailored to the given StoreContext."""
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.strftime("%A, %d %B %Y")
+    owner_name = context.owner_first_name or "Store Owner"
+    state_name = STATE_CODE_TO_NAME.get(context.state_code, f"State code {context.state_code}")
 
-    prefs = context.preferences or {}
-    pref_lines: list[str] = []
-    preferred_brands = prefs.get("preferred_brands", {})
-    for item, brand in preferred_brands.items():
-        pref_lines.append(f"  - Default {item}: {brand}")
-    pref_text = "\n".join(pref_lines) if pref_lines else "  None set"
-
+    # Build active bill summary line if a draft bill exists
+    bill_info = "None"
     if context.active_draft_bill_id:
-        bill_info = f"OPEN — draft_bill_id={context.active_draft_bill_id}"
-    else:
-        bill_info = "None"
+        bill_info = f"Draft Bill open ID={context.active_draft_bill_id}"
 
+    # Owner preferences text
+    pref_text = ""
+    if context.preferences:
+        pref_lines = []
+        for k, v in context.preferences.items():
+            pref_lines.append(f"  - {k}: {v}")
+        pref_text = "\n".join(pref_lines)
+    else:
+        pref_text = "  (No custom preferences configured)"
+
+    # Stage-specific guidance based on workflow_state
     if context.workflow_state == "UNREGISTERED":
-        task_guidance = _build_unregistered_guidance(context)
+        task_guidance = (
+            "The store is NOT yet registered. Guide the owner through registration step by step:\n"
+            "1. Ask for store name.\n"
+            "2. Ask for 10-digit mobile number.\n"
+            "3. Ask for GST state code (2-digit, e.g., '29' for Karnataka, '37' for AP) or state name.\n"
+            "4. Ask for GSTIN (optional) and Shop Address (optional).\n"
+            "5. Once details are provided, call setup_store(...) to register the shop.\n"
+            "Do NOT offer billing, inventory, or khata features until registration is complete."
+        )
 
     elif context.workflow_state == "PENDING_CATALOGUE":
-        task_guidance = _build_pending_catalogue_guidance(context)
+        task_guidance = (
+            "Registration is complete! The shop has no items in its catalogue yet.\n"
+            "Prompt the owner to add their first products:\n"
+            "Ask: 'Let's add items to your store catalogue! What products do you sell?'\n"
+            "For each product, ask for:\n"
+            "  - Name\n"
+            "  - Branded vs Loose (loose items are always 0% GST)\n"
+            "  - Unit (KG, PACKET, PIECE, L, etc.)\n"
+            "  - Cost Price & Selling Price (MRP)\n"
+            "  - GST Rate (mandatory for branded: 5 / 12 / 18 / 28%)\n"
+            "Call add_product(...) to save items.\n"
+            "Do NOT offer billing until catalogue and inventory are set up."
+        )
 
     elif context.workflow_state == "PENDING_INVENTORY":
         task_guidance = (
-            f"INVENTORY SETUP — Catalogue is ready. Now add initial stock.\n"
-            f"\n"
-            f"Step 1: Call list_products() to show what is in the catalogue.\n"
-            f"        list_products returns FULL product_ids — use them exactly in receive_stock.\n"
-            f"Step 2: Ask: 'Which product did you receive, and how many units?'\n"
-            f"Step 3a: Product IS in catalogue:\n"
-            f"         Call receive_stock(product_id='<FULL UUID>', quantity=<number>)\n"
-            f"         The product_id must be the FULL UUID from list_products, NOT a shortened version.\n"
-            f"Step 3b: Product is NOT in catalogue:\n"
-            f"         Say: 'This product is not in your catalogue yet. Would you like to add it first?'\n"
-            f"         If YES: collect details step by step, including:\n"
-            f"                 - If BRANDED: ask GST rate (5 / 12 / 18 / 28 %) — MANDATORY, NEVER assume 0.\n"
-            f"                 - If LOOSE: gst_rate = 0 automatically.\n"
-            f"                 Confirm details, call add_product, ask for quantity,\n"
-            f"                 then call receive_stock(product_id=<from add_product result>, quantity=<n>).\n"
-            f"         If NO: skip.\n"
-            f"\n"
-            f"BILLING IS NOT AVAILABLE until at least one stock entry exists.\n"
-            f"If owner asks to make a bill: say 'Please add stock to inventory first.'\n"
-            f"\n"
-            f"EDITING: update_product_details(product_id, ...) for any catalogue field.\n"
-            f"         update_store(...) for shop details. update_owner_name(...) for profile.\n"
-            f"Do NOT pass store_id or telegram_user_id — automatic.\n"
-            f"Once at least one stock entry is received, the store becomes ACTIVE."
+            "Catalogue has items, but no stock has been added to inventory yet!\n"
+            "Prompt the owner to add initial stock for their products:\n"
+            "Say: 'Great! Now let's add initial stock to your inventory.'\n"
+            "Call receive_stock(product_id, quantity) to log initial stock.\n"
+            "BILLING IS NOT AVAILABLE until at least one stock entry exists.\n"
+            "If owner asks to make a bill: say 'Please add stock to inventory first.'\n\n"
+            "EDITING: update_product_details(product_id, ...) for any catalogue field.\n"
+            "         update_store(...) for shop details. update_owner_name(...) for profile.\n"
+            "Do NOT pass store_id or telegram_user_id — automatic.\n"
+            "Once at least one stock entry is received, the store becomes ACTIVE."
         )
 
     else:  # ACTIVE
@@ -243,36 +124,36 @@ def build_system_prompt(context: StoreContext) -> str:
             "    and sets status to PENDING_PAYMENT.\n"
             "    ⚠️  For CREDIT: finalize_bill(payment_mode='CREDIT', is_credit=True, customer_id=<id>)\n"
             "    ⚠️  NEVER call add_credit_entry directly — finalize_bill handles khata automatically.\n\n"
-            "  STAGE 3 — Payment confirmation & Overpayment handling:\n"
-            "    When owner states payment received (e.g. 'paid 250' on a ₹222.00 bill):\n"
-            "    1. CALL ONLY confirm_payment() in this turn.\n"
+            "  STAGE 3 — Payment confirmation & Overpayment handling (EVERY BILL IS AN INDEPENDENT TRANSACTION):\n"
+            "    When owner states payment received (e.g. 'paid 70' on a ₹43.68 bill or 'paid 120' on ₹87.36 bill):\n"
+            "    1. CALL ONLY confirm_payment() IN THIS TURN.\n"
             "       confirm_payment() takes NO arguments and marks the bill CONFIRMED.\n"
-            "       ⚠️ CRITICAL: DO NOT call add_customer or add_payment_entry in this turn!\n"
+            "       ⚠️ STRICT RULE: DO NOT CALL get_customer, add_customer, OR add_payment_entry IN THIS TURN!\n"
+            "       ⚠️ NEVER REUSE A CUSTOMER FROM A PREVIOUS BILL IN THE CONVERSATION HISTORY! EACH BILL IS FOR A NEW WALK-IN CUSTOMER BY DEFAULT!\n"
             "    2. Respond to the owner with payment status & change calculation:\n"
             "       - Exact payment: 'Payment confirmed! Bill paid in full.'\n"
-            "       - Overpayment (e.g., bill is ₹514.40, owner states '550 paid'):\n"
-            "         Calculate change: ₹550.00 - ₹514.40 = ₹35.60.\n"
+            "       - Overpayment (e.g., bill is ₹43.68, owner states 'paid 70'):\n"
+            "         Calculate change: ₹70.00 - ₹43.68 = ₹26.32.\n"
             "         Confirm payment AND MUST ASK THIS QUESTION EXACTLY:\n"
-            "         \"Payment confirmed! Change is ₹35.60. Would you like to return ₹35.60 as change, or add ₹35.60 to customer's khata?\"\n"
-            "         ⚠️ DO NOT claim that change/credit has been recorded in khata! You haven't called any khata tool yet!\n"
-            "         ⚠️ DO NOT call any khata tools in this turn! You MUST wait for the owner's answer first.\n"
-            "    3. Next turn — handling the owner\'s choice:\n"
+            "         \"Payment confirmed! Change is ₹26.32. Would you like to return ₹26.32 as change, or add ₹26.32 to customer's khata?\"\n"
+            "         ⚠️ DO NOT automatically look up or add the change to Kiran or any previous customer!\n"
+            "         ⚠️ DO NOT call any khata tools in this turn! You MUST stop and wait for the owner's answer first.\n"
+            "    3. Next turn — handling the owner's choice:\n"
             "       - IF owner says 'return' / 'give change' / 'no khata':\n"
-            "         No khata entry needed! Simply acknowledge: 'Understood, please give ₹28.00 change to the customer.'\n"
+            "         No khata entry needed! Simply acknowledge: 'Understood, please return the change to the customer.'\n"
             "       - IF owner says 'add to khata' / 'save to khata':\n"
-            "         a. Check if customer name and 10-digit mobile number are already provided. If not, ask:\n"
-            "            'Please provide the customer\'s name and 10-digit mobile number.'\n"
+            "         a. ASK FOR CUSTOMER DETAILS: 'Please provide the customer's name and 10-digit mobile number.'\n"
+            "            (Do NOT assume it is the same customer from a prior bill!)\n"
             "         b. Call get_customer(phone) to check if customer exists.\n"
             "            - If found: use returned customer_id UUID.\n"
             "            - If not found: call add_customer(name, phone) → get returned customer_id UUID.\n"
             "         c. Call add_payment_entry(customer_id=<UUID>, amount=<extra_amount>).\n"
-            "         d. Confirm: 'Saved ₹<extra> to <customer_name>\'s khata account.'\n"
+            "         d. Confirm: 'Saved ₹<extra> to <customer_name>'s khata account.'\n"
             "    If NO payment received: bill stays PENDING_PAYMENT.\n"
-            "    ⚠️ CRITICAL RULES FOR OVERPAYMENT:\n"
-            "    - NEVER auto-create a \"Walk-in Customer\" or call add_payment_entry automatically upon confirming payment!\n"
-            "    - ALWAYS confirm payment AND ask the owner first whether to return change or save to khata.\n"
-            "    - NEVER pass dummy strings like \'WALK_IN_CUSTOMER\' to khata tools.\n"
-            "    - NEVER call finalize_bill again after it has already succeeded.\n\n"
+            "    ⚠️ CRITICAL OVERPAYMENT RULES:\n"
+            "    - EVERY BILL MUST INDEPENDENTLY ASK whether to return change or save to khata.\n"
+            "    - NEVER auto-lookup phone numbers or customers from previous bills in conversation history!\n"
+            "    - ALWAYS call confirm_payment() ONLY on the payment confirmation turn.\n\n"
             "  STAGE 4 — Done:\n"
             "    Show bill summary. Ask if owner needs anything else.\n\n"
             "CANCELLATION / REVERSAL:\n"

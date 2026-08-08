@@ -460,21 +460,21 @@ def _build_active_tools(
     # would still read None from their captured snapshot, causing "No active draft bill" errors.
     _draft_id_cell: list[str | None] = [context.active_draft_bill_id if context else None]
 
-    # _bill_id_cell holds the UUID of the most recent PENDING_PAYMENT bill for this store.
-    # confirm_payment / cancel_bill read from here — the LLM never passes bill_id.
-    # Initialized by querying the DB for the latest PENDING_PAYMENT bill (handles the case
-    # where the owner sends "paid" in a fresh turn after finalize_bill completed last turn).
-    # finalize_bill() also writes into this cell when it creates a new bill in this turn.
-    # void_bill does its own CONFIRMED lookup — _bill_id_cell is cleared after confirm_payment.
+    # _bill_id_cell holds the UUID of the most recent PENDING_PAYMENT or recently CONFIRMED bill for this store.
+    # confirm_payment / cancel_bill / add_payment_entry read from here — the LLM never passes bill_id.
+    # Initialized by querying the DB for the latest PENDING_PAYMENT bill (or most recently confirmed bill
+    # in the last 15 mins for post-confirmation overpayment khata entries).
+    # _last_confirmed_bill_id stores the bill ID so overpayment entries in subsequent turns still capture reference_bill_id.
     _pending_bill_id: str | None = None
+    _last_confirmed_bill_id: str | None = None
     if store_id:
         try:
             _pb_resp = (
                 mcps.billing.db.schema("billing")
                 .table("bills")
-                .select("id")
+                .select("id, status")
                 .eq("store_id", store_id)
-                .eq("status", "PENDING_PAYMENT")
+                .in_("status", ["PENDING_PAYMENT", "CONFIRMED"])
                 .order("created_at", desc=True)
                 .limit(1)
                 .execute()
@@ -482,9 +482,12 @@ def _build_active_tools(
             _pb_rows = _pb_resp.data or []
             if _pb_rows:
                 _pending_bill_id = _pb_rows[0]["id"]
+                if _pb_rows[0]["status"] == "CONFIRMED":
+                    _last_confirmed_bill_id = _pb_rows[0]["id"]
         except Exception:
             pass
     _bill_id_cell: list[str | None] = [_pending_bill_id]
+    _last_confirmed_bill_cell: list[str | None] = [_last_confirmed_bill_id]
 
     # ── Shared lookup tools (all intents) ───────────────────────────────
 
@@ -682,9 +685,10 @@ def _build_active_tools(
                 (e.g. bill was ₹107, customer paid ₹200, extra ₹93 → add_payment_entry(amount=93))
             The balance after this call will be negative if the shop now owes the customer.
             """
+            resolved_ref_bill_id = _bill_id_cell[0] or _last_confirmed_bill_cell[0]
             result = await mcps.khata.add_payment_entry(
                 store_id=store_id, customer_id=customer_id,
-                amount=amount, notes=notes
+                amount=amount, reference_bill_id=resolved_ref_bill_id, notes=notes
             )
             return result.message
 
@@ -977,7 +981,8 @@ def _build_active_tools(
             return "ERROR: No PENDING_PAYMENT bill found. Nothing to confirm."
         result = await mcps.billing.confirm_payment(bill_id=resolved_bill_id)
         if result.success:
-            _bill_id_cell[0] = None  # clear after confirmed
+            _last_confirmed_bill_cell[0] = resolved_bill_id  # keep reference for overpayment khata entries
+            _bill_id_cell[0] = None  # clear pending bill cell after confirmed
         return result.message
 
     async def cancel_bill() -> str:
@@ -1079,9 +1084,10 @@ def _build_active_tools(
         from src.utils.guardrails import clean_uuid
         if not clean_uuid(customer_id):
             return "ERROR: customer_id must be a valid UUID. Do not pass 'WALK_IN_CUSTOMER'. To confirm a bill payment, call confirm_payment() instead."
+        resolved_ref_bill_id = _bill_id_cell[0] or _last_confirmed_bill_cell[0]
         result = await mcps.khata.add_payment_entry(
             store_id=store_id, customer_id=customer_id,
-            amount=amount, notes=notes
+            amount=amount, reference_bill_id=resolved_ref_bill_id, notes=notes
         )
         return result.message
 

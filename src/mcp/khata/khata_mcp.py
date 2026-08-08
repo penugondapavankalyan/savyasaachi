@@ -218,6 +218,7 @@ class KhataMCP:
         store_id: str,
         customer_id: str,
         amount: float,
+        reference_bill_id: Optional[str] = None,
         notes: Optional[str] = None,
     ) -> KhataEntryResult:
         """
@@ -237,6 +238,7 @@ class KhataMCP:
                     "customer_id": customer_id,
                     "entry_type": "PAYMENT",
                     "amount_delta": -amount,
+                    "reference_bill_id": reference_bill_id,
                     "notes": notes,
                 }
             )
