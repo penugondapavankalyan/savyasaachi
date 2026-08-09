@@ -88,7 +88,9 @@ class InventoryMCP:
         unit = prod["unit"]
 
         # ── Guardrails — phase 2: unit-based quantity validation ─────────
-        quantity = clean_quantity_for_unit(quantity, unit, "quantity")
+        quantity = clean_quantity_for_unit(
+            quantity, unit, "quantity", is_loose=prod.get("is_loose", True)
+        )
 
         # Call the increment_stock RPC (atomic add + movement record)
         rpc_resp = self.db.rpc(

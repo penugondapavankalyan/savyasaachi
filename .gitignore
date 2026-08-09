@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+.env.example
+.bob/
+run_local.py
+kirana_agent.pdf
