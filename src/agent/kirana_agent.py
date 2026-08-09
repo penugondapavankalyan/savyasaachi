@@ -184,7 +184,7 @@ class KiranaAgent:
                     system_prompt=system_prompt,
                     tools=tools,
                     output_type=str,
-                    model_settings=ModelSettings(max_tokens=max_tokens),
+                    model_settings=ModelSettings(max_tokens=max_tokens, timeout=30.0),
                 )
                 result = await agent.run(
                     user_message,

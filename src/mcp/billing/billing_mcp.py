@@ -185,7 +185,9 @@ class BillingMCP:
         product = await self._catalogue.get_product(store_id, product_id)
 
         # ── Guardrails — phase 2: unit-based quantity validation ─────────
-        quantity = clean_quantity_for_unit(quantity, product.unit, "quantity")
+        quantity = clean_quantity_for_unit(
+            quantity, product.unit, "quantity", is_loose=product.is_loose
+        )
 
         # 3. Availability check
         availability = await self._inventory.check_availability(
@@ -308,7 +310,9 @@ class BillingMCP:
         product = await self._catalogue.get_product(store_id, product_id)
 
         # Unit-based quantity validation (same rules as add_item_to_draft)
-        new_quantity = clean_quantity_for_unit(new_quantity, product.unit, "new_quantity")
+        new_quantity = clean_quantity_for_unit(
+            new_quantity, product.unit, "new_quantity", is_loose=product.is_loose
+        )
 
         availability = await self._inventory.check_availability(
             store_id, product_id, new_quantity

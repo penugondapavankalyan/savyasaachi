@@ -359,15 +359,19 @@ def clean_quantity_for_unit(
     quantity: float,
     unit: str,
     field_name: str = "quantity",
+    is_loose: bool = True,
 ) -> float:
     """
-    Validate that quantity is appropriate for the given unit.
+    Validate that quantity is appropriate for the given unit and item type (branded vs loose).
 
     Rules:
-      KG, L          → float allowed  (e.g. 0.5 KG sugar, 0.25 L oil)
-      G, ML          → integer only   (e.g. 200 G, 500 ML — not 200.5 G)
-      PACKET, PIECE,
-      DOZEN, BUNDLE  → integer only   (e.g. 2 packets — not 1.5 packets)
+      - BRANDED items (is_loose=False): CANNOT be sold in fractional quantities under any unit!
+        Must always be a whole number (e.g. 1 packet, 2 KG packaged flour).
+      - LOOSE items (is_loose=True):
+        - KG, L          → float allowed  (e.g. 0.5 KG loose sugar, 0.25 L loose oil)
+        - G, ML, PACKET,
+          PIECE, DOZEN,
+          BUNDLE         → integer only   (e.g. 200 G, 2 packets — not 1.5 packets)
 
     Also enforces positivity (quantity > 0).
 
@@ -375,7 +379,7 @@ def clean_quantity_for_unit(
         ValueError with a clear human-readable message on any violation.
 
     Returns:
-        float — the validated quantity (always a whole number for integer-only units)
+        float — the validated quantity
     """
     # Normalise unit
     u = unit.strip().upper() if unit else ""
@@ -386,7 +390,14 @@ def clean_quantity_for_unit(
 
     qty = float(quantity)
 
-    # Step 2 — integer-only units: reject fractional quantities
+    # Step 2 — Branded items CANNOT be sold in fractional quantities
+    if not is_loose and qty != int(qty):
+        raise ValueError(
+            f"Invalid quantity {qty} for branded item: Branded items cannot be sold in fractional quantities. "
+            f"Please enter a whole number quantity (e.g. {int(qty) or 1} or {int(qty) + 1})."
+        )
+
+    # Step 3 — integer-only units: reject fractional quantities for loose items
     if u in _INTEGER_ONLY_UNITS:
         if qty != int(qty):
             reason = _UNIT_REASON.get(u, f"{u} items are sold as whole units")
@@ -396,10 +407,8 @@ def clean_quantity_for_unit(
             )
         return float(int(qty))   # normalise 2.0 → 2.0 (no trailing decimals issue)
 
-    # Step 3 — float-allowed units: just ensure positive (already checked above)
-    # KG and L: up to 3 decimal places is sensible (e.g. 0.250 KG)
+    # Step 4 — float-allowed units for loose items: round to 3 decimal places
     if u in _FLOAT_ALLOWED_UNITS:
-        # Round to 3 decimal places to avoid floating-point artefacts
         return round(qty, 3)
 
     # Unknown unit — shouldn't reach here if clean_unit() was called first,

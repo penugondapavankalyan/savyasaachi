@@ -538,6 +538,15 @@ def _build_active_tools(
                 cost_price=cost_price, mrp=mrp, reorder_level=reorder_level,
                 brand=brand, hsn_code=hsn_code, gst_rate=gst_rate, telegram_user_id=tuid,
             )
+            return result.message + f"\n[product_id={result.product_id}] — MANDATORY: If the owner provided initial stock quantity in their prompt, IMMEDIATELY call receive_stock(product_id, initial_stock_qty) in this same turn!"
+
+        async def receive_stock(product_id: str, quantity: float, notes: str | None = None) -> str:
+            """Record received stock for a product."""
+            from src.mcp.inventory.models import ReceiveStockResult
+            result: ReceiveStockResult = await mcps.inventory.receive_stock(
+                store_id=store_id, product_id=product_id,
+                quantity=quantity, notes=notes, telegram_user_id=tuid,
+            )
             return result.message
 
         async def update_product_details(
@@ -586,7 +595,7 @@ def _build_active_tools(
             )
             return result.message
 
-        return [search_products, list_products, add_product, update_product_details,
+        return [search_products, list_products, add_product, receive_stock, update_product_details,
                 deactivate_product, update_store, update_owner_name]
 
     # ── INVENTORY intent ─────────────────────────────────────────────────
@@ -842,8 +851,17 @@ def _build_active_tools(
         """
         Add a product to the active bill draft.
         - product_id: FULL UUID from search_products or list_products — never invent.
-        - quantity: how many units.
+        - quantity: how many units the owner wants to sell.
         Do NOT pass draft_bill_id — resolved automatically from the active draft.
+
+        QUANTITY RULES — validate BEFORE calling this tool:
+          BRANDED items (is_loose=False): quantity MUST be a whole number (1, 2, 3...).
+            Fractional quantities (e.g. 1.5) are INVALID — tell owner immediately.
+          LOOSE items (is_loose=True):
+            - KG, L: fractional quantities allowed (e.g. 0.5 KG, 0.25 L).
+            - G, ML, PACKET, PIECE, DOZEN, BUNDLE: whole numbers only.
+        If quantity violates these rules, DO NOT call this tool — tell the owner the
+        quantity is invalid and ask for a correct whole number.
         """
         from src.utils.guardrails import clean_uuid
         if not clean_uuid(product_id):
@@ -871,41 +889,81 @@ def _build_active_tools(
 
     async def remove_item_from_draft(product_id: str) -> str:
         """
-        Remove a product from the active bill draft.
-        - product_id: FULL UUID from search_products.
+        Remove an entire product line from the active bill draft.
+        - product_id: FULL UUID of the product — get it from get_draft_bill() to see
+          what is currently in the draft, or from search_products() if not yet retrieved.
+          NEVER invent or guess a product_id.
         Do NOT pass draft_bill_id — resolved automatically.
+
+        NOTE: This removes the product completely. To change quantity instead, use
+        update_item_quantity(). Only use this tool when the owner wants to remove the
+        item entirely from the bill.
         """
         from src.utils.guardrails import clean_uuid
         if not clean_uuid(product_id):
-            return f"ERROR: '{product_id}' is not a valid product_id. Call search_products() first."
+            return f"ERROR: '{product_id}' is not a valid product_id. Call get_draft_bill() to see current items, or search_products() to find the product."
         resolved_id = _draft_id_cell[0]
         if not resolved_id:
             return "ERROR: No active draft bill. Call create_draft_bill() first."
-        result = await mcps.billing.remove_item_from_draft(
-            draft_bill_id=resolved_id, product_id=product_id
-        )
+        try:
+            result = await mcps.billing.remove_item_from_draft(
+                draft_bill_id=resolved_id, product_id=product_id
+            )
+        except ValueError as e:
+            msg = str(e)
+            if "not found" in msg.lower():
+                return (
+                    f"ERROR: product_id '{product_id}' does not exist. "
+                    "Call get_draft_bill() to see the correct product_ids in this draft."
+                )
+            return f"ERROR: {msg}"
         return str(result)
 
     async def update_item_quantity(product_id: str, quantity: float) -> str:
         """
         Update the quantity of an item already in the active bill draft.
-        - product_id: FULL UUID from search_products.
+        - product_id: FULL UUID of the product — get it from get_draft_bill() to see
+          what is currently in the draft, or from search_products() if not yet retrieved.
+          NEVER invent or guess a product_id.
+        - quantity: the NEW total quantity (not a delta). E.g. to change 3 KG to 2 KG, pass quantity=2.
         Do NOT pass draft_bill_id — resolved automatically.
+
+        QUANTITY RULES — validate BEFORE calling this tool:
+          BRANDED items (is_loose=False): quantity MUST be a whole number (1, 2, 3...).
+            Fractional quantities (e.g. 1.5) are INVALID — tell owner immediately.
+          LOOSE items (is_loose=True):
+            - KG, L: fractional quantities allowed (e.g. 0.5 KG, 0.25 L).
+            - G, ML, PACKET, PIECE, DOZEN, BUNDLE: whole numbers only.
+        If quantity violates these rules, DO NOT call this tool — tell the owner the
+        quantity is invalid and ask for a correct whole number.
         """
         from src.utils.guardrails import clean_uuid
         if not clean_uuid(product_id):
-            return f"ERROR: '{product_id}' is not a valid product_id. Call search_products() first."
+            return f"ERROR: '{product_id}' is not a valid product_id. Call get_draft_bill() to see current items, or search_products() to find the product."
         resolved_id = _draft_id_cell[0]
         if not resolved_id:
             return "ERROR: No active draft bill. Call create_draft_bill() first."
-        result = await mcps.billing.update_item_quantity(
-            draft_bill_id=resolved_id, product_id=product_id, new_quantity=quantity
-        )
+        try:
+            result = await mcps.billing.update_item_quantity(
+                draft_bill_id=resolved_id, product_id=product_id, new_quantity=quantity
+            )
+        except ValueError as e:
+            msg = str(e)
+            if "not found" in msg.lower():
+                return (
+                    f"ERROR: product_id '{product_id}' does not exist. "
+                    "Call get_draft_bill() to see the correct product_ids in this draft."
+                )
+            return f"ERROR: {msg}"
         return str(result)
 
     async def get_draft_bill() -> str:
-        """Get the current contents and total of the active bill draft.
+        """Get the current contents and GST-inclusive total of the active bill draft.
         Do NOT pass draft_bill_id — resolved automatically.
+
+        MANDATORY before Stage 2 (payment mode): call this tool to get the accurate
+        total_amount (with GST). NEVER quote a total from memory or conversation history
+        — always call this tool so the owner sees the correct amount before paying.
         """
         resolved_id = _draft_id_cell[0]
         if not resolved_id:
@@ -972,27 +1030,45 @@ def _build_active_tools(
     async def confirm_payment() -> str:
         """
         Confirm that payment was received for the current PENDING_PAYMENT bill.
-        Call this after cash is handed over, UPI transfer received, or credit accepted.
-        Moves the bill from PENDING_PAYMENT → CONFIRMED.
+        MANDATORY: Call this tool immediately when owner states payment received (e.g. 'paid 20', 'paid 50', 'confirmed').
+        You MUST execute this tool call — never reply with text without executing confirm_payment!
+        Moves the bill from PENDING_PAYMENT → CONFIRMED in the database.
         Do NOT pass bill_id — resolved automatically from the server.
         """
         resolved_bill_id = _bill_id_cell[0]
         if not resolved_bill_id:
             return "ERROR: No PENDING_PAYMENT bill found. Nothing to confirm."
+
+        # Fetch bill detail before confirming so we can pass total_amount in result message
+        bill_total = None
+        try:
+            bill_detail = await mcps.billing.get_bill(bill_id=resolved_bill_id)
+            bill_total = bill_detail.total_amount
+        except Exception:
+            pass
+
         result = await mcps.billing.confirm_payment(bill_id=resolved_bill_id)
         if result.success:
             _last_confirmed_bill_cell[0] = resolved_bill_id  # keep reference for overpayment khata entries
             _bill_id_cell[0] = None  # clear pending bill cell after confirmed
-        return result.message
+
+        total_info = f" | Bill Total Amount: ₹{bill_total:.2f}" if bill_total is not None else ""
+        return (
+            f"{result.message}{total_info}\n"
+            f"CRITICAL INSTRUCTION FOR NEXT STEP:\n"
+            f"Compare the owner's paid amount against Bill Total (₹{bill_total:.2f} if available):\n"
+            f"- IF EXACT PAYMENT: Confirm payment in full.\n"
+            f"- IF UNDERPAYMENT (e.g. paid ₹10 on a ₹33.60 bill): Calculate remaining balance (₹{bill_total - 10:.2f} if ₹10 paid). MANDATORY: Tell owner received ₹10.00, remaining balance is ₹{bill_total - 10:.2f} which MUST be added to Khata credit, and ask for customer name and 10-digit mobile number!\n"
+            f"- IF OVERPAYMENT: Calculate change and ask owner whether to return cash change or add to customer's khata!"
+        ) if bill_total is not None else result.message
 
     async def cancel_bill() -> str:
         """
-        Cancel the current PENDING_PAYMENT bill (before payment is confirmed).
+        Cancel the current PENDING_PAYMENT bill before payment is confirmed.
+        MANDATORY: Call this tool immediately when owner says 'cancel', 'wrong items', or 'start over' AFTER finalize_bill.
         Restores all stock back to inventory and reverses any khata entry.
-        Use when owner says 'cancel', 'wrong items', or 'start over' AFTER finalize_bill
-        but BEFORE confirm_payment.
         Do NOT pass bill_id — resolved automatically from the server.
-        DO NOT use this on CONFIRMED bills — use void_bill instead.
+        DO NOT say a bill cannot be cancelled — PENDING_PAYMENT bills CAN be cancelled via cancel_bill().
         """
         resolved_bill_id = _bill_id_cell[0]
         if not resolved_bill_id:
@@ -1140,7 +1216,7 @@ def _build_active_tools(
             search_products,
             confirm_payment, cancel_bill, void_bill,
             get_bill,
-            add_customer, get_customer, add_payment_entry,
+            add_customer, get_customer, add_credit_entry, add_payment_entry,
         ]
 
     # ── BILLING (default) — draft-building tools ──────────────────────────────
@@ -1181,8 +1257,8 @@ INTENT_KEYWORDS: dict[str, list[str]] = {
         # Post-finalize actions: confirm payment, cancel or void a bill.
         # These route to a smaller tool set that doesn't include draft-building tools.
         "confirm payment", "confirm the payment", "payment confirmed", "payment done",
-        "void bill", "void the bill", "cancel bill", "cancel the bill",
-        "undo bill", "reverse bill", "payment received",
+        "void bill", "void the bill", "cancel bill", "cancel the bill", "cancel",
+        "undo bill", "reverse bill", "undo", "void", "payment received",
         # "paid <amount>" after finalize means payment confirmation, not a khata entry.
         "paid", "yes paid", "payment done",
     ],
