@@ -20,6 +20,7 @@ def _one(resp):
 
 
 from datetime import date
+from src.utils.ist import date_range_iso, today_ist
 from typing import Optional
 
 from src.db.supabase_client import get_client
@@ -55,7 +56,7 @@ class AnalyticsMCP:
         Return daily sales summary.  Uses cached daily_summary if available,
         otherwise computes live from billing.bills.
         """
-        target_date = summary_date or date.today().isoformat()
+        target_date = summary_date or today_ist().isoformat()
 
         # Try cached
         cached_resp = (
@@ -82,7 +83,7 @@ class AnalyticsMCP:
         """
         Aggregate bills into daily_summary.  Idempotent (ON CONFLICT DO UPDATE).
         """
-        target_date = summary_date or date.today().isoformat()
+        target_date = summary_date or today_ist().isoformat()
         live = await self._compute_summary_live(store_id, target_date, is_day_closed=False)
 
         # Check if previously closed
@@ -183,8 +184,8 @@ class AnalyticsMCP:
             .table("bills")
             .select("id")
             .eq("store_id", store_id)
-            .gte("created_at", f"{start_date}T00:00:00Z")
-            .lte("created_at", f"{end_date}T23:59:59Z")
+            .gte("created_at", date_range_iso(start_date, end_date)[0])
+            .lte("created_at", date_range_iso(start_date, end_date)[1])
             .execute()
         )
         bill_ids = [r["id"] for r in (bills_resp.data or [])]
@@ -318,8 +319,8 @@ class AnalyticsMCP:
             .table("bills")
             .select("id")
             .eq("store_id", store_id)
-            .gte("created_at", f"{start_date}T00:00:00Z")
-            .lte("created_at", f"{end_date}T23:59:59Z")
+            .gte("created_at", date_range_iso(start_date, end_date)[0])
+            .lte("created_at", date_range_iso(start_date, end_date)[1])
             .execute()
         )
         bill_ids = [r["id"] for r in (bills_resp.data or [])]
@@ -424,8 +425,8 @@ class AnalyticsMCP:
             .table("bills")
             .select("total_amount, total_cgst, total_sgst, payment_mode, is_credit")
             .eq("store_id", store_id)
-            .gte("created_at", f"{target_date}T00:00:00Z")
-            .lte("created_at", f"{target_date}T23:59:59Z")
+            .gte("created_at", date_range_iso(target_date, target_date)[0])
+            .lte("created_at", date_range_iso(target_date, target_date)[1])
             .execute()
         )
         bills = bills_resp.data or []

@@ -375,37 +375,64 @@ class CatalogueMCP:
         active_only: bool = True,
     ) -> list[ProductResult]:
         """
-        Full-text search using the pg_trgm / to_tsvector index.
-        Returns up to 10 results ordered by relevance.
+        Substring search on name and brand.
+        Also tries stemmed variants of the query so that plural/suffix forms
+        (e.g. 'pencils', 'sugars', 'biscuits') match the stored singular name.
+        Returns up to 10 results ordered by name.
         """
-        q = (
+        base_q = (
             self.db.schema("catalogue")
             .table("products")
             .select("*")
             .eq("store_id", store_id)
         )
         if active_only:
-            q = q.eq("is_active", True)
+            base_q = base_q.eq("is_active", True)
 
-        # Use ilike for substring match (supabase-py doesn't expose ts_rank directly)
-        # The DB has a trigram index; this fallback works for Phase 1
-        search_term = f"%{query}%"
-        resp = q.ilike("name", search_term).limit(10).execute()
+        # Build a set of search terms: original query + stemmed variants.
+        # Strip common English plural/suffix endings so "pencils" → "pencil",
+        # "sugars" → "sugar", "biscuits" → "biscuit", etc.
+        terms: list[str] = [query.strip()]
+        q_lower = query.strip().lower()
+        for suffix in ("ies", "es", "s"):
+            if q_lower.endswith(suffix) and len(q_lower) > len(suffix) + 2:
+                stem = q_lower[: -len(suffix)]
+                if stem not in [t.lower() for t in terms]:
+                    terms.append(stem)
+                break  # only strip one suffix
 
-        results = resp.data or []
+        seen_ids: set[str] = set()
+        results: list[dict] = []
 
-        # Also search by brand if no name hits
+        for term in terms:
+            search_term = f"%{term}%"
+            resp = base_q.ilike("name", search_term).limit(10).execute()
+            for row in (resp.data or []):
+                if row["id"] not in seen_ids:
+                    seen_ids.add(row["id"])
+                    results.append(row)
+            if results:
+                break  # name hit found — no need to try more stems
+
+        # Fall back to brand search if still no hits
         if not results:
-            resp2 = (
-                self.db.schema("catalogue")
-                .table("products")
-                .select("*")
-                .eq("store_id", store_id)
-                .ilike("brand", search_term)
-                .limit(10)
-                .execute()
-            )
-            results = resp2.data or []
+            for term in terms:
+                search_term = f"%{term}%"
+                resp2 = (
+                    self.db.schema("catalogue")
+                    .table("products")
+                    .select("*")
+                    .eq("store_id", store_id)
+                    .ilike("brand", search_term)
+                    .limit(10)
+                    .execute()
+                )
+                for row in (resp2.data or []):
+                    if row["id"] not in seen_ids:
+                        seen_ids.add(row["id"])
+                        results.append(row)
+                if results:
+                    break
 
         return [_row_to_product(r) for r in results]
 

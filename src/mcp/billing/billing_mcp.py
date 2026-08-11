@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from src.utils.ist import date_range_iso
 from typing import TYPE_CHECKING, Optional
 
 from src.db.supabase_client import get_client
@@ -627,13 +628,18 @@ class BillingMCP:
         # 9. Clear active_draft_bill_id
         await self._identity.set_active_draft_bill(telegram_user_id, None)
 
-        # 10. If credit bill → create khata entry
+        # 10. If credit bill → auto-confirm + create khata entry
         if is_credit and customer_id:
+            # Credit bills are immediately CONFIRMED — the debt is recorded in khata.
+            # No cash/UPI payment is expected, so confirm_payment() must NOT be called.
+            self.db.rpc("confirm_payment", {"p_bill_id": bill_id}).execute()
+
             await self._khata.add_credit_entry(
                 store_id=store_id,
                 customer_id=customer_id,
                 amount=draft_detail.total_amount,
                 reference_bill_id=bill_id,
+                notes=f"Credit sale — bill {bill_number}",
             )
 
         return FinalizedBillResult(
@@ -650,9 +656,9 @@ class BillingMCP:
             is_credit=is_credit,
             already_finalized=False,
             message=(
-                f"✅ Bill {bill_number} ready. Total: ₹{draft_detail.total_amount:.2f} | {payment_mode.upper()}"
-                + (" | Credit" if is_credit else "")
-                + " | Status: PENDING_PAYMENT — call confirm_payment(bill_id) once payment is received."
+                f"✅ Bill {bill_number} finalized. Total: ₹{draft_detail.total_amount:.2f} | {payment_mode.upper()}"
+                + (f" | CREDIT — bill CONFIRMED, ₹{draft_detail.total_amount:.2f} added to customer khata." if is_credit else
+                   " | Status: PENDING_PAYMENT — call confirm_payment() once cash/UPI payment is received.")
             ),
         )
 
@@ -666,6 +672,98 @@ class BillingMCP:
         return CancelResult(
             success=bool(result.get("success", False)),
             message=result.get("message", "Unknown error from confirm_payment RPC."),
+        )
+
+    async def link_bill_customer(self, bill_id: str, customer_id: str) -> CancelResult:
+        """
+        Set customer_id on a cash/UPI bill that was finalized without one.
+        Called after underpayment or overpayment identifies the customer.
+        Idempotent — safe to call even if already linked.
+        """
+        resp = self.db.rpc(
+            "set_bill_customer",
+            {"p_bill_id": bill_id, "p_customer_id": customer_id},
+        ).execute()
+        result = resp.data
+        return CancelResult(
+            success=bool(result.get("success", False)),
+            message=result.get("message", "Unknown error from set_bill_customer RPC."),
+        )
+
+    async def change_payment_mode(
+        self,
+        bill_id: str,
+        new_payment_mode: str,
+        telegram_user_id: int,
+    ) -> FinalizedBillResult:
+        """
+        Change the payment mode of a PENDING_PAYMENT bill.
+
+        Because billing.bills is immutable (only status transitions allowed),
+        this is done by:
+          1. Cancelling the PENDING_PAYMENT bill (restores stock).
+          2. Creating a new draft from the cancelled bill's items.
+          3. Finalizing the new draft with the new payment mode.
+
+        Returns the new FinalizedBillResult. The old bill_id is gone — the
+        caller should update their bill_id reference to the new bill.
+        """
+        new_payment_mode = clean_payment_mode(new_payment_mode)
+
+        # 1. Load the bill and its items before cancelling
+        bill_resp = (
+            self.db.schema("billing")
+            .table("bills")
+            .select("*")
+            .eq("id", bill_id)
+            .limit(1)
+            .execute()
+        )
+        bill = _one(bill_resp)
+        if not bill:
+            raise ValueError(f"Bill {bill_id} not found.")
+        if bill["status"] != "PENDING_PAYMENT":
+            raise ValueError(
+                f"Only PENDING_PAYMENT bills can have their payment mode changed. "
+                f"This bill is {bill['status']}."
+            )
+
+        store_id = bill["store_id"]
+        items = await self._get_bill_items(bill_id)
+        if not items:
+            raise ValueError("Cannot change payment mode — bill has no items.")
+
+        # 2. Cancel the existing bill (restores stock)
+        cancel_resp = self.db.rpc("cancel_bill", {"p_bill_id": bill_id}).execute()
+        cancel_result = cancel_resp.data
+        if not cancel_result.get("success"):
+            raise RuntimeError(
+                f"Failed to cancel bill during payment mode change: "
+                f"{cancel_result.get('message', 'unknown error')}"
+            )
+
+        # 3. Create a new draft
+        draft = await self.create_draft_bill(
+            store_id=store_id, telegram_user_id=telegram_user_id
+        )
+        new_draft_id = draft.draft_bill_id
+
+        # 4. Re-add all items to the new draft
+        for item in items:
+            if not item.product_id:
+                continue  # skip if product was deleted from catalogue
+            await self.add_item_to_draft(
+                draft_bill_id=new_draft_id,
+                store_id=store_id,
+                product_id=item.product_id,
+                quantity=item.quantity,
+            )
+
+        # 5. Finalize with the new payment mode
+        return await self.finalize_bill(
+            draft_bill_id=new_draft_id,
+            payment_mode=new_payment_mode,
+            telegram_user_id=telegram_user_id,
         )
 
     async def cancel_bill(self, bill_id: str) -> CancelResult:
@@ -765,8 +863,8 @@ class BillingMCP:
             .table("bills")
             .select("id, bill_number, total_amount, payment_mode, is_credit, created_at")
             .eq("store_id", store_id)
-            .gte("created_at", f"{date}T00:00:00Z")
-            .lte("created_at", f"{date}T23:59:59Z")
+            .gte("created_at", date_range_iso(date, date)[0])
+            .lte("created_at", date_range_iso(date, date)[1])
             .order("created_at")
             .execute()
         )
