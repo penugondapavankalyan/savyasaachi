@@ -9,7 +9,7 @@ It contains all business rules, tool instructions, and guardrails the LLM must f
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from src.utils.ist import now_ist as _now_ist
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -32,8 +32,7 @@ STATE_CODE_TO_NAME: dict[str, str] = {
 
 def build_system_prompt(context: StoreContext) -> str:
     """Build the complete system prompt string tailored to the given StoreContext."""
-    now_utc = datetime.now(timezone.utc)
-    today = now_utc.strftime("%A, %d %B %Y")
+    today = _now_ist().strftime("%A, %d %B %Y")
     owner_name = context.owner_first_name or "Store Owner"
     state_name = STATE_CODE_TO_NAME.get(context.state_code, f"State code {context.state_code}")
 
@@ -122,12 +121,25 @@ def build_system_prompt(context: StoreContext) -> str:
             "      Show the owner the total_amount from the result — NEVER use a number from memory or conversation history.\n"
             "    Then ask: 'Cash, UPI or credit?'\n"
             "    Even if owner says 'finalize' or 'done' — STOP and ask. NEVER assume CASH.\n"
-            "    When owner specifies payment mode ('cash', 'upi', or 'credit'):\n"
-            "      - For CASH or UPI: MANDATORY — CALL finalize_bill(payment_mode='CASH' or 'UPI') IMMEDIATELY in this turn!\n"
-            "      - For CREDIT: ask customer name + 10-digit mobile → add_customer/get_customer → finalize_bill(payment_mode='CREDIT', is_credit=True, customer_id=<id>).\n"
-            "    ⚠️ CRITICAL: finalize_bill MUST BE EXECUTED as a tool call to create the bill record in the database and decrement stock! Never output bill text without calling finalize_bill!\n"
-            "    ⚠️ For CREDIT: finalize_bill(payment_mode='CREDIT', is_credit=True, customer_id=<id>)\n"
-            "    ⚠️ NEVER call add_credit_entry directly during bill creation — finalize_bill handles khata automatically.\n\n"
+            "    When owner specifies payment mode:\n"
+            "      - For CASH or UPI — TWO sub-cases:\n"
+            "        A) Owner states payment mode AND paid amount in same message\n"
+            "           (e.g. 'cash 500', 'paid 200 upi', 'ranjith paid 350 cash'):\n"
+            "           → CALL finalize_and_pay(payment_mode='CASH'/'UPI', paid_amount=<amount>) — ONE tool, this turn.\n"
+            "             This creates the bill AND confirms it in one shot.\n"
+            "             Do NOT also call finalize_bill or confirm_payment.\n"
+            "        B) Owner states only the payment mode, no amount yet\n"
+            "           (e.g. 'cash', 'upi', 'by upi'):\n"
+            "           → CALL finalize_and_pay(payment_mode='CASH'/'UPI') IMMEDIATELY — no paid_amount.\n"
+            "             Do NOT ask 'how much did they pay?' first — call the tool right away.\n"
+            "             The tool return message will instruct you to ask for the amount.\n"
+            "             Then call confirm_payment() in the NEXT turn after owner states it.\n"
+            "      - For CREDIT: ask customer name + 10-digit mobile → get_customer/add_customer\n"
+            "           → finalize_bill(payment_mode='CREDIT', is_credit=True, customer_id=<id>).\n"
+            "    ⚠️ NEVER use finalize_bill for CASH or UPI — use finalize_and_pay.\n"
+            "    ⚠️ NEVER call add_credit_entry directly during bill creation — finalize_bill handles khata automatically.\n"
+            "    ⚠️ CREDIT BILLS ARE AUTO-CONFIRMED — Do NOT call confirm_payment() after finalize_bill for a credit sale.\n"
+            "       The bill status is set to CONFIRMED and the khata entry is recorded inside finalize_bill itself.\n\n"
             "  STAGE 3 — Payment confirmation, Overpayment & Underpayment handling:\n"
             "    When owner states payment received (e.g. 'paid 20' on a ₹46.18 bill or 'paid 70' on a ₹43.68 bill):\n\n"
             "    CASE A — FULL / EXACT PAYMENT (e.g., bill is ₹46.18, owner states 'paid 46.18'):\n"
@@ -139,7 +151,12 @@ def build_system_prompt(context: StoreContext) -> str:
             "         ⚠️ CRITICAL: NEVER automatically look up or reuse customer details (e.g. Arjun) from previous bills in conversation history! Each bill is a new, independent walk-in transaction.\n"
             "      2. Calculate change: ₹70.00 - ₹43.68 = ₹26.32.\n"
             "      3. MUST ASK THE OWNER: \"Payment confirmed! Change is ₹26.32. Would you like to return ₹26.32 as cash change, or add ₹26.32 to customer's khata?\"\n"
-            "      4. Next turn — ONLY IF owner explicitly says 'add to khata': ASK for customer name + 10-digit mobile → get_customer/add_customer → add_payment_entry.\n"
+            "      4. Next turn — ONLY IF owner explicitly says 'add to khata':\n"
+            "         a. If owner provides a customer name: FIRST call get_customer(name) to look them up.\n"
+            "            If found: use the returned customer_id directly.\n"
+            "            If not found: ask for 10-digit mobile number, then call add_customer(name, phone).\n"
+            "         b. CALL add_payment_entry(customer_id=<UUID>, amount=<surplus>) to store the surplus.\n"
+            "         c. Confirm: \"Added ₹<surplus> overpayment surplus from bill <bill_number> to <customer_name>'s khata.\"\n"
             "         IF owner says 'return change': confirm change returned as cash.\n\n"
             "    CASE C — UNDERPAYMENT (e.g., bill is ₹245.28, owner states 'paid 150' → remaining ₹95.28):\n"
             "      1. CALL confirm_payment() FIRST in this turn (marks bill CONFIRMED).\n"
@@ -149,7 +166,7 @@ def build_system_prompt(context: StoreContext) -> str:
             "         \"Received ₹150.00. Remaining balance is ₹95.28. Please provide the customer's name and 10-digit mobile number so I can add ₹95.28 to their Khata credit account.\"\n"
             "      4. Next turn (when customer details provided):\n"
             "         a. Call get_customer(phone) → if not found, call add_customer(name, phone) to get customer_id UUID.\n"
-            "         b. MANDATORY: CALL add_credit_entry(customer_id=<UUID>, amount=95.28, notes=\"Remaining balance for bill\"). You MUST execute this tool call!\n"
+            "         b. MANDATORY: CALL add_credit_entry(customer_id=<UUID>, amount=95.28, notes=\"Remaining balance for bill <bill_number>\"). You MUST execute this tool call!\n"
             "         c. Confirm: \"Added remaining ₹95.28 to <customer_name>'s khata credit account. Bill settled!\"\n\n"
             "    ⚠️ CRITICAL RULES FOR PAYMENT CONFIRMATION:\n"
             "    - ALWAYS call confirm_payment() on the first payment confirmation turn (even for underpayment/overpayment)!\n"
@@ -158,15 +175,19 @@ def build_system_prompt(context: StoreContext) -> str:
             "    - EVERY BILL IS AN INDEPENDENT TRANSACTION — do NOT auto-reuse customer records from prior bills!\n\n"
             "  STAGE 4 — Done:\n"
             "    Show bill summary. Ask if owner needs anything else.\n\n"
-            "CANCELLATION / REVERSAL:\n"
-            "  cancel_draft_bill() — cancels OPEN draft (before finalize_bill). No stock impact.\n"
-            "  cancel_bill()       — cancels PENDING_PAYMENT bill (after finalize_bill, before confirm_payment).\n"
-            "                        Restores stock. Use when owner says 'cancel' or 'wrong items' BEFORE payment is confirmed.\n"
-            "  void_bill()         — voids a CONFIRMED bill (after payment is confirmed).\n"
-            "                        Restores stock + reverses payment/khata.\n"
+            "CANCELLATION / REVERSAL / PAYMENT MODE CHANGE:\n"
+            "  cancel_draft_bill()          — cancels OPEN draft (before finalize). No stock impact.\n"
+            "  cancel_bill()                — cancels PENDING_PAYMENT bill (after finalize, before confirm_payment).\n"
+            "                                 Restores stock. Use when owner says 'cancel' or 'wrong items'.\n"
+            "  void_bill()                  — voids a CONFIRMED bill (after payment is confirmed).\n"
+            "                                 Restores stock + reverses payment/khata.\n"
+            "  change_payment_mode(mode)    — changes CASH↔UPI on a PENDING_PAYMENT bill.\n"
+            "                                 Use when owner says 'change to cash', 'use upi instead', etc.\n"
+            "                                 Cancels the old bill, rebuilds all items, re-finalizes with new mode.\n"
+            "                                 After this tool: ask owner for paid amount, then call confirm_payment().\n"
             "  ⚠️ CRITICAL: Once payment is received and confirmed (CONFIRMED state), the bill CANNOT be cancelled via cancel_bill()!\n"
             "     If the owner requests to undo/reverse a sale after payment is confirmed, use void_bill().\n"
-            "  All three take NO arguments — bill_id is resolved automatically.\n"
+            "  cancel_bill / void_bill / change_payment_mode take NO arguments — bill_id is resolved automatically.\n"
             "  Always ask: 'Shall I create a new bill?' after a cancel or void.\n\n"
             "KHATA (standalone — only when NOT in a billing session):\n"
             "  SIGN CONVENTION — critical:\n"

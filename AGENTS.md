@@ -13,6 +13,74 @@ There is no framework test runner (e.g. `pytest`) or linter config in this repos
 - **Deploy to AWS Lambda**: `bash scripts/deploy.sh`
 - **Register Telegram Webhook**: `python scripts/register_webhook.py`
 
+## Deploy to Telegram + AWS Lambda (End-to-End)
+
+### Prerequisites
+- AWS CLI configured (`aws configure`) with an IAM user that has Lambda + IAM permissions.
+- A Telegram bot token — get one from [@BotFather](https://t.me/BotFather) via `/newbot`.
+- A filled-in `.env` file (copy from `.env.example`).
+
+### Step 1 — One-time Lambda setup (skip if function already exists)
+```bash
+# Create execution role
+aws iam create-role --role-name kirana-agent-lambda-role \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam attach-role-policy --role-name kirana-agent-lambda-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+# Build initial zip
+pip install -r requirements.txt -t package/
+cp -r src/ package/
+cd package && zip -r ../kirana-agent.zip . && cd ..
+
+# Create function
+aws lambda create-function \
+  --function-name kirana-agent \
+  --runtime python3.12 \
+  --handler src.handler.lambda_handler \
+  --role arn:aws:iam::YOUR_ACCOUNT_ID:role/kirana-agent-lambda-role \
+  --timeout 29 \
+  --memory-size 512 \
+  --region ap-south-1 \
+  --zip-file fileb://kirana-agent.zip
+
+# Set all environment variables (required: TELEGRAM_BOT_TOKEN, SUPABASE_URL,
+# SUPABASE_SERVICE_ROLE_KEY, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN,
+# GROQ_API_KEY; optional: LLM_PROVIDER, LLM_MODEL, LLM_FALLBACK_MODELS)
+aws lambda update-function-configuration \
+  --function-name kirana-agent \
+  --environment "Variables={TELEGRAM_BOT_TOKEN=...,SUPABASE_URL=...,SUPABASE_SERVICE_ROLE_KEY=...,UPSTASH_REDIS_REST_URL=...,UPSTASH_REDIS_REST_TOKEN=...,GROQ_API_KEY=...,LLM_PROVIDER=groq,LLM_MODEL=qwen/qwen3.6-27b,LLM_FALLBACK_MODELS=llama-3.3-70b-versatile}"
+
+# Create public Function URL (Telegram needs a public HTTPS endpoint)
+aws lambda create-function-url-config --function-name kirana-agent --auth-type NONE
+aws lambda add-permission --function-name kirana-agent \
+  --action lambda:InvokeFunctionUrl --principal "*" \
+  --function-url-auth-type NONE --statement-id AllowPublicInvoke
+# → Note the FunctionUrl from the output (e.g. https://xxxx.lambda-url.ap-south-1.on.aws/)
+```
+
+### Step 2 — Register the Telegram webhook
+```bash
+export TELEGRAM_BOT_TOKEN=your_token_here
+python scripts/register_webhook.py --url https://YOUR_FUNCTION_URL/
+python scripts/register_webhook.py --info   # verify it was set
+```
+
+### Step 3 — Subsequent deploys
+```bash
+bash scripts/deploy.sh
+# Auto-detects zip size; if >50 MB uploads via S3 (set DEPLOY_S3_BUCKET env var first).
+# Waits for Lambda to finish updating before exiting.
+```
+
+### Key deployment facts
+- Lambda function name is hard-coded as `kirana-agent` in `scripts/deploy.sh`.
+- Region defaults to `ap-south-1`; override with `AWS_REGION=us-east-1 bash scripts/deploy.sh`.
+- Timeout is **29 seconds** — intentionally one second under Telegram's 30 s webhook timeout.
+- Lambda handler path: `src.handler.lambda_handler` (dot-separated module path).
+- `LLM_PROVIDER` and all LLM keys must be set as Lambda environment variables — `.env` is NOT packaged.
+- To check logs: `aws logs tail /aws/lambda/kirana-agent --follow --region ap-south-1`
+
 ## Code Style & Conventions
 
 ### Imports, Types & Naming
