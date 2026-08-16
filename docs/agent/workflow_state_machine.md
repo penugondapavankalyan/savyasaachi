@@ -62,14 +62,21 @@ This is **not** an intent router. The model still reasons freely within the avai
                               │ receive_stock() called at least once
                               │ (stock_movements count for store >= 1)
                               ▼
-                   ┌────────────────────┐
-                   │      ACTIVE        │
-                   │                    │
-                   │ Tools: all 7 MCPs  │
-                   │                    │
-                   │ (terminal state    │
-                   │  in Phase 1)       │
-                   └────────────────────┘
+                   ┌────────────────────────────────────────┐
+                   │                ACTIVE                  │
+                   │                                        │
+                   │ Tools: all 8 MCPs, intent-sub-grouped  │
+                   │                                        │
+                   │ Intent groups (max ~12 tools each):    │
+                   │   BILLING        — draft & finalize    │
+                   │   BILLING_CONFIRM — confirm/cancel/void│
+                   │   INVENTORY      — stock management    │
+                   │   KHATA          — credit ledger       │
+                   │   ANALYTICS      — reports, docs       │
+                   │   CATALOGUE      — product management  │
+                   │                                        │
+                   │ (terminal state in Phase 1)            │
+                   └────────────────────────────────────────┘
 ```
 
 ---
@@ -278,3 +285,25 @@ Adding new states requires:
 1. Adding to `user_workflow_state` enum in Supabase migration
 2. Adding tool subset in `get_tools_for_state()`
 3. Adding transition trigger in the relevant MCP
+
+---
+
+## ACTIVE State Intent Groups
+
+In the `ACTIVE` state, the tool list is too large to pass to the LLM at once (~50+ functions). The `detect_intent()` function in `tool_registry.py` selects one of 6 sub-groups based on the message:
+
+| Intent Group | Trigger Keywords / Conditions | Key Tools |
+|---|---|---|
+| `BILLING` (default) | Bill-related words, or has active draft | `create_draft_bill`, `add_item_to_draft`, `finalize_bill`, `finalize_and_pay`, khata tools |
+| `BILLING_CONFIRM` | No active draft AND PENDING_PAYMENT/recent CONFIRMED bill exists | `confirm_payment`, `cancel_bill`, `void_bill`, `void_bill_by_number`, `change_payment_mode`, khata tools |
+| `INVENTORY` | Stock, restock, inventory, low stock | `receive_stock`, `get_stock`, `get_all_stock`, `get_low_stock_items` |
+| `KHATA` | Credit, balance, khata, customer (without active draft) | `add_customer`, `get_customer`, `add_credit_entry`, `add_payment_entry`, `get_payment_history` |
+| `ANALYTICS` | Sales, summary, report, analysis, PDF, PPTX | Analytics and document tools |
+| `CATALOGUE` | Add product, update product, catalogue (without active draft) | `add_product`, `update_product_details`, `deactivate_product` |
+
+**Important disambiguation rule:** Payment-mode keywords ("credit", "cash", "upi") during an active billing session (`has_active_draft=True`) route to `BILLING`, not `KHATA`. This prevents a credit sale from accidentally routing to the khata management group.
+
+**`BILLING_CONFIRM` group:** Activated when there is no active draft but a `PENDING_PAYMENT` or recently `CONFIRMED` bill exists in the DB. This contains the post-finalization tools (payment confirmation, cancellation, khata resolution for over/underpayment).
+
+- **`void_bill()`** — zero-argument, targets the most recently CONFIRMED bill for the store. Use for same-session "undo" immediately after `confirm_payment`.
+- **`void_bill_by_number(bill_number_or_id)`** — accepts a human bill number (e.g. `BL-003-20260815-009`) or UUID. Use when the owner explicitly names an older bill to void. Resolves bill number → UUID via a `billing.bills` DB lookup scoped to `store_id`, then calls `BillingMCP.void_bill()`.

@@ -164,6 +164,24 @@ class Settings:
         return _optional("LAMBDA_ENV", "dev")
 
     @property
+    def LOCAL_MODE(self) -> bool:
+        """
+        True when running via run_local.py (not on Lambda).
+        Set LOCAL_MODE=true in .env to enable local document preview.
+        When True, send_document() saves files to LOCAL_DOCS_OUTPUT_DIR
+        and opens them with the OS default viewer instead of posting to Telegram.
+        """
+        return _optional("LOCAL_MODE", "false").lower() in ("true", "1", "yes")
+
+    @property
+    def LOCAL_DOCS_OUTPUT_DIR(self) -> str:
+        """
+        Directory where generated PDFs/PPTXs are saved when LOCAL_MODE=true.
+        Defaults to a 'local_output' folder in the project root.
+        """
+        return _optional("LOCAL_DOCS_OUTPUT_DIR", str(_root / "local_output"))
+
+    @property
     def LAMBDA_FUNCTION_URL(self) -> str:
         return _optional("LAMBDA_FUNCTION_URL")
 

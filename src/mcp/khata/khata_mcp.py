@@ -65,6 +65,7 @@ class KhataMCP:
         """
         # ── Guardrails ──────────────────────────────────────────────────
         name = clean_name(name, "customer name")
+        name = name.title() if name else name
         notes = clean_optional_str(notes)
 
         # Phone is mandatory — clean and validate strictly

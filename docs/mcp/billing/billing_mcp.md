@@ -1,8 +1,9 @@
 # MCP Module: Billing MCP
 
-**Domain:** Billing  
-**Module Path:** `src/mcp/billing/billing_mcp.py`  
-**Owned Tables:** `draft_bills`, `draft_bill_items`, `bills`, `bill_items`
+**Domain:** Billing
+**Module Path:** `src/mcp/billing/billing_mcp.py`
+**Owned Tables:** `billing.draft_bills`, `billing.draft_bill_items`, `billing.bills`, `billing.bill_items`
+**Calls Into:** `CatalogueMCP`, `InventoryMCP`, `KhataMCP`, `IdentityMCP`, `PaymentsMCP` (late-bound)
 
 ---
 
@@ -290,16 +291,43 @@ BEGIN;
 COMMIT;
 ```
 
-**Post-Finalization:**
+**Post-Finalization (Credit Bills Only):**
 ```python
-# If credit bill → create khata entry
+# Step 10 — credit bill: auto-confirm + khata entry + payment row (all in one turn)
 if is_credit and customer_id:
-    await khata_mcp.add_credit_entry(
+    # Flip bill to CONFIRMED immediately (no payment collected)
+    db.rpc("confirm_payment", {"p_bill_id": bill_id}).execute()
+
+    # Create khata entry (customer now owes the shop)
+    khata_entry = await khata_mcp.add_credit_entry(
         store_id=store_id,
         customer_id=customer_id,
         amount=total_amount,
-        reference_bill_id=bill_id
+        reference_bill_id=bill_id,
+        notes=f"Credit sale — bill {bill_number}",
     )
+
+    # Insert KHATA payment row (paid_amount=0, khata_entry_id links the debt)
+    if self._payments:
+        await self._payments.record_payment(
+            store_id=store_id,
+            bill_id=bill_id,
+            bill_number=bill_number,
+            customer_id=customer_id,
+            khata_entry_id=khata_entry.entry_id,
+            paid_amount=0.0,
+            payment_mode=payment_mode.upper(),
+            payment_type="KHATA",
+            payment_status="CONFIRMED",
+            subtotal=subtotal,
+            total_gst=total_cgst + total_sgst,
+            bill_amount=total_amount,
+            change_amount=0.0,
+            balance_due=total_amount,
+        )
+# For CASH/UPI bills: bill is left in PENDING_PAYMENT status.
+# The agent tool confirm_payment(paid_amount) MUST be called after the owner
+# reports the cash/UPI amount received. Do NOT call it for credit bills.
 ```
 
 **Business Rules:**
@@ -307,6 +335,8 @@ if is_credit and customer_id:
 2. **All-or-nothing:** Single DB transaction — partial bill creation is impossible
 3. **Stock only decremented on finalize:** Not on draft item add
 4. **Don't-sell-below-cost guard:** Before inserting bill_items, validate no `unit_price < cost_price`
+5. **Credit bills are auto-CONFIRMED at finalize time** — no separate `confirm_payment()` call
+6. **CASH/UPI bills end in PENDING_PAYMENT** — require `confirm_payment(paid_amount)` tool call
 
 ---
 
@@ -329,7 +359,87 @@ UPDATE workflow_state SET active_draft_bill_id = NULL WHERE telegram_user_id = ?
 
 ---
 
-### 8. `get_bill`
+### 8. `confirm_payment` (MCP method, not the tool)
+
+**Description:** Flips a `PENDING_PAYMENT` bill to `CONFIRMED` via the DB RPC. Called by the `confirm_payment` tool in `tool_registry.py` after the payment amount is received. Does NOT insert a payments row — that is done by the tool.
+
+**Signature:**
+```python
+async def confirm_payment(self, bill_id: str) -> CancelResult
+```
+
+**Important:** This method only transitions the bill status. The tool in `tool_registry.py` wraps it with payment classification and `PaymentsMCP.record_payment()`.
+
+---
+
+### 9. `cancel_bill`
+
+**Description:** Cancels a `PENDING_PAYMENT` or `CONFIRMED` bill. Inserts a `CANCELLED` audit row in `payments.payments`.
+
+**Signature:**
+```python
+async def cancel_bill(self, bill_id: str) -> CancelResult
+```
+
+**Side effects:**
+- DB RPC `cancel_bill()` transitions bill status to `CANCELLED`
+- `PaymentsMCP.record_payment(payment_type='CANCELLED', payment_status='CANCELLED')` creates audit row
+
+---
+
+### 10. `void_bill`
+
+**Description:** Voids a `CONFIRMED` bill (reversal/refund). Inserts a `REFUNDED` audit row in `payments.payments`.
+
+**Signature:**
+```python
+async def void_bill(self, bill_id: str) -> CancelResult
+```
+
+**Side effects:**
+- DB RPC `void_bill()` transitions bill status to `VOID`
+- `PaymentsMCP.record_payment(payment_type='REFUNDED', payment_status='REFUNDED')` creates audit row
+
+---
+
+### 10a. `void_bill_by_number` *(agent tool only — no new MCP method)*
+
+**Description:** Agent-layer tool that lets the owner void **any named historical bill** by its human bill number (e.g. `BL-003-20260815-009`) or UUID. Resolves the bill number → UUID via a DB lookup on `billing.bills` scoped to `store_id`, then calls `BillingMCP.void_bill()` with the resolved UUID.
+
+**Why a separate tool:** The existing `void_bill()` tool is zero-argument and hardcodes "fetch the most recent CONFIRMED bill" — correct for the in-session case (owner says "undo" immediately after payment). When the owner specifies a bill by name from a previous session, `void_bill_by_number(bill_number_or_id)` is the correct tool.
+
+**Signature (tool closure in `tool_registry.py`):**
+```python
+async def void_bill_by_number(bill_number_or_id: str) -> str
+```
+
+**Resolution logic:**
+```python
+if is_valid_uuid(bill_number_or_id):
+    resolved_id = bill_number_or_id
+else:
+    # DB lookup: billing.bills WHERE store_id=? AND bill_number=?
+    resolved_id = lookup_bill_id_by_number(bill_number_or_id, store_id)
+```
+
+**Registered in:** `BILLING_CONFIRM` intent group.
+
+---
+
+### 11. `get_bill_for_payment`
+
+**Description:** Fetches minimal bill details needed by the `confirm_payment` tool (total, payment mode, bill number, subtotal, GST). Used internally — not exposed as an LLM tool.
+
+**Signature:**
+```python
+async def get_bill_for_payment(self, bill_id: str) -> dict | None
+```
+
+Returns dict with keys: `id`, `bill_number`, `total_amount`, `payment_mode`, `payment_reference`, `subtotal`, `total_cgst`, `total_sgst`, `customer_id`, `is_credit`.
+
+---
+
+### 12. `get_bill`
 
 **Description:** Returns a finalized bill with all its items. Used for PDF generation and review.
 
@@ -340,7 +450,7 @@ async def get_bill(bill_id: str) -> BillDetailResult
 
 ---
 
-### 9. `get_bills_by_date`
+### 13. `get_bills_by_date`
 
 **Description:** Returns all finalized bills for a store on a specific date. Used by Analytics MCP.
 
@@ -393,8 +503,36 @@ Bill totals:
   → finalize_bill(payment_mode='UPI') → creates bill BL-2024-001
   → decrements stock for all 3 items
   → workflow_state.active_draft_bill_id → NULL
-  → returns bill summary with GST breakup
+  → bill status = PENDING_PAYMENT
+  → returns bill summary: "Bill BL-2024-001 finalised. Total ₹419.58. Call confirm_payment() once paid."
+
+9:14 AM  Owner: "paid 500"
+  → confirm_payment(paid_amount=500)
+  → bill flipped PENDING_PAYMENT → CONFIRMED
+  → OVERPAYMENT detected (₹500 - ₹419.58 = ₹80.42 extra)
+  → Redis: pending_payment:{tuid} = {intent_type: OVERPAYMENT, delta_amount: 80.42, ...}
+  → Agent: "₹80.42 overpaid. Return change or add to customer khata?"
+
+9:14 AM  Owner: "add to khata, Ramesh"
+  → get_customer("Ramesh") → customer_id
+  → add_payment_entry(customer_id, amount=None)   ← amount=None reads from Redis
+  → khata entry inserted, khata_entry_id obtained
+  → payments row inserted (type=OVERPAYMENT, paid=500, change=80.42)
+  → Redis key cleared
 ```
+
+---
+
+## Payment Status Transitions
+
+```
+PENDING_PAYMENT  ──(confirm_payment RPC)──►  CONFIRMED
+                 ──(cancel_bill RPC)────────►  CANCELLED
+
+CONFIRMED        ──(void_bill RPC)──────────►  VOID
+```
+
+Transitions are enforced by a DB trigger (`bill_status_flow` in migration 014). Any other transition raises an exception.
 
 ---
 
@@ -414,5 +552,6 @@ Bill totals:
 | Feature | Change |
 |---|---|
 | Discount support | `total_discount` already in bills schema — add `apply_discount()` tool |
-| Bill void/reversal | Add `void_bill()` tool (creates reversal stock movements) |
 | IGST | Add `gst_type` field to bills, update computation logic |
+| Split payments | Add second payment row per bill; update `payments.payments` schema |
+| Payment dashboard | `PaymentsMCP.get_payment_history()` already supports this |

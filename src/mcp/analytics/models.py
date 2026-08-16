@@ -86,11 +86,30 @@ class GSTSummaryResult(BaseModel):
     by_slab: list[GSTSlabSummary]
 
 
+class CustomerCreditSummary(BaseModel):
+    customer_id: str
+    name: str
+    phone: str
+    balance: float          # positive = owes shop; negative = shop owes customer
+
+
+class KhataOverviewData(BaseModel):
+    total_credit_given: float           # sum of positive balances (shop is owed)
+    total_shop_owes: float              # sum of abs(negative balances) (shop owes customers)
+    credit_customer_count: int          # number of customers with positive balance
+    shop_owes_customer_count: int       # number of customers with negative balance
+    highest_debtor: Optional[CustomerCreditSummary]     # customer who owes shop the most
+    highest_creditor: Optional[CustomerCreditSummary]   # customer shop owes the most
+    credit_by_day: list[tuple[str, float]]              # [(date_str, credit_amount), ...]
+
+
 class AnalyticsDeckData(BaseModel):
     store_name: str
     period_label: str
     summary: DailySummaryResult
+    daily_summaries: list[DailySummaryResult]   # per-day rows for the period (for PPTX table)
     sales_trend: list[DailyTrendPoint]
     top_items: list[TopItemResult]
     stock_health: StockHealthReport
     gst_summary: GSTSummaryResult
+    khata_overview: KhataOverviewData

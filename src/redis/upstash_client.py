@@ -1,9 +1,16 @@
 """
-Upstash Redis HTTP client for conversation history.
+Upstash Redis HTTP client for conversation history and payment intents.
 
-Each Telegram user has one key:  conv:{telegram_user_id}
-Value: JSON-encoded list of message dicts, capped at 200 entries.
-TTL: 24 hours (sliding – reset on every write).
+Keys managed:
+  conv:{telegram_user_id}
+      JSON-encoded list of message dicts, capped at 200 entries.
+      TTL: 24 hours (sliding – reset on every write).
+
+  pending_payment:{telegram_user_id}
+      JSON-encoded PendingPaymentIntent dict.
+      Set when an over/underpayment is detected and awaiting customer resolution.
+      TTL: 30 minutes. Deleted immediately once resolved.
+      Prevents LLM from hallucinating amounts between turns.
 
 Uses the Upstash pipeline endpoint for atomic SET + EX in one HTTP call.
 """
@@ -22,7 +29,8 @@ class UpstashRedisClient:
     """Thin async wrapper around the Upstash REST API."""
 
     MAX_STORED_MESSAGES = 200
-    TTL_SECONDS = 86_400  # 24 hours
+    TTL_SECONDS = 86_400           # 24 hours — conversation history
+    PAYMENT_INTENT_TTL = 1_800     # 30 minutes — pending payment intents
 
     def __init__(self) -> None:
         self.base_url = settings.UPSTASH_REDIS_REST_URL.rstrip("/")
@@ -75,6 +83,66 @@ class UpstashRedisClient:
         async with httpx.AsyncClient(timeout=5.0) as client:
             await client.get(
                 f"{self.base_url}/del/conv:{telegram_user_id}",
+                headers=self.headers,
+            )
+
+    # ------------------------------------------------------------------
+    # Pending payment intent (over/underpayment resolution)
+    # ------------------------------------------------------------------
+
+    async def set_pending_payment(
+        self,
+        telegram_user_id: int,
+        intent: dict,
+    ) -> None:
+        """
+        Store a pending payment intent for 30 minutes.
+
+        Called when confirm_payment detects over/underpayment and needs
+        to remember the delta amount until the next turn resolves it.
+        The intent dict matches PendingPaymentIntent fields.
+        """
+        key = f"pending_payment:{telegram_user_id}"
+        value = json.dumps(intent)
+        pipeline_payload = [
+            ["SET", key, value, "EX", str(self.PAYMENT_INTENT_TTL)]
+        ]
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                f"{self.base_url}/pipeline",
+                headers=self.headers,
+                json=pipeline_payload,
+            )
+
+    async def get_pending_payment(
+        self,
+        telegram_user_id: int,
+    ) -> dict | None:
+        """
+        Retrieve the pending payment intent for a user.
+        Returns None if not set or expired.
+        """
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{self.base_url}/get/pending_payment:{telegram_user_id}",
+                headers=self.headers,
+            )
+        result = resp.json().get("result")
+        if not result:
+            return None
+        try:
+            return json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    async def clear_pending_payment(self, telegram_user_id: int) -> None:
+        """
+        Delete the pending payment intent.
+        Called once the over/underpayment is fully resolved.
+        """
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.get(
+                f"{self.base_url}/del/pending_payment:{telegram_user_id}",
                 headers=self.headers,
             )
 

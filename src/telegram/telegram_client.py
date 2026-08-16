@@ -44,7 +44,15 @@ class TelegramClient:
         file_path: str,
         caption: Optional[str] = None,
     ) -> dict:
-        """Send a file (PDF or PPTX)."""
+        """
+        Send a file (PDF or PPTX).
+
+        In LOCAL_MODE (run_local.py): copies the file to LOCAL_DOCS_OUTPUT_DIR
+        and opens it with the OS default viewer. No Telegram API call is made.
+        In production (Lambda): uploads to Telegram's sendDocument API.
+        """
+        if settings.LOCAL_MODE:
+            return self._send_document_local(file_path, caption)
         async with httpx.AsyncClient(timeout=60.0) as client:
             with open(file_path, "rb") as f:
                 resp = await client.post(
@@ -53,6 +61,43 @@ class TelegramClient:
                     files={"document": f},
                 )
         return resp.json()
+
+    def _send_document_local(self, file_path: str, caption: Optional[str]) -> dict:
+        """
+        Local-mode document handler: copies the file to LOCAL_DOCS_OUTPUT_DIR
+        and opens it with the system default application (Preview on macOS,
+        Edge/Acrobat on Windows, xdg-open on Linux).
+        """
+        import shutil
+        import subprocess
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        out_dir = _Path(settings.LOCAL_DOCS_OUTPUT_DIR)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        dest = out_dir / _Path(file_path).name
+        shutil.copy2(file_path, dest)
+
+        # Print visible path to terminal so developer always knows where the file is
+        print(f"\n  📄  Document saved locally: {dest}")
+        if caption:
+            print(f"      Caption: {caption}")
+        print()
+
+        # Try to open with OS default viewer (best-effort, never blocks the agent)
+        try:
+            if _sys.platform == "win32":
+                import os as _os
+                _os.startfile(str(dest))
+            elif _sys.platform == "darwin":
+                subprocess.Popen(["open", str(dest)])
+            else:
+                subprocess.Popen(["xdg-open", str(dest)])
+        except Exception:
+            pass  # viewer launch is optional — file is saved regardless
+
+        return {"ok": True, "local_path": str(dest)}
 
     async def send_typing_action(self, chat_id: int) -> None:
         """Show the typing indicator."""

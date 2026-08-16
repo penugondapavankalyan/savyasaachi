@@ -222,3 +222,6 @@ __marimo__/
 .bob/
 run_local.py
 kirana_agent.pdf
+local_output/
+package/
+savyasaachi-v1.zip

@@ -380,15 +380,6 @@ class CatalogueMCP:
         (e.g. 'pencils', 'sugars', 'biscuits') match the stored singular name.
         Returns up to 10 results ordered by name.
         """
-        base_q = (
-            self.db.schema("catalogue")
-            .table("products")
-            .select("*")
-            .eq("store_id", store_id)
-        )
-        if active_only:
-            base_q = base_q.eq("is_active", True)
-
         # Build a set of search terms: original query + stemmed variants.
         # Strip common English plural/suffix endings so "pencils" → "pencil",
         # "sugars" → "sugar", "biscuits" → "biscuit", etc.
@@ -405,8 +396,21 @@ class CatalogueMCP:
         results: list[dict] = []
 
         for term in terms:
+            # Build a FRESH query each iteration — the supabase-py query builder
+            # mutates its internal params object in-place via .add().  Reusing the
+            # same base_q across iterations would accumulate ilike filters as AND
+            # conditions (e.g. name=ilike.%pencils% AND name=ilike.%pencil%) which
+            # can never both be satisfied simultaneously, always returning 0 rows.
             search_term = f"%{term}%"
-            resp = base_q.ilike("name", search_term).limit(10).execute()
+            q = (
+                self.db.schema("catalogue")
+                .table("products")
+                .select("*")
+                .eq("store_id", store_id)
+            )
+            if active_only:
+                q = q.eq("is_active", True)
+            resp = q.ilike("name", search_term).limit(10).execute()
             for row in (resp.data or []):
                 if row["id"] not in seen_ids:
                     seen_ids.add(row["id"])

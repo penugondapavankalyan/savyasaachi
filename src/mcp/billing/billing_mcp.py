@@ -5,7 +5,7 @@ Owns: billing.draft_bills, billing.draft_bill_items,
       billing.bills, billing.bill_items
 Reads: billing.customers (owned by KhataMCP)
 
-Calls internally: CatalogueMCP, InventoryMCP, KhataMCP, IdentityMCP
+Calls internally: CatalogueMCP, InventoryMCP, KhataMCP, IdentityMCP, PaymentsMCP
 """
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from src.mcp.identity.identity_mcp import IdentityMCP
     from src.mcp.inventory.inventory_mcp import InventoryMCP
     from src.mcp.khata.khata_mcp import KhataMCP
+    from src.mcp.payments.payments_mcp import PaymentsMCP
 
 
 class BillingMCP:
@@ -63,12 +64,18 @@ class BillingMCP:
         inventory_mcp: "InventoryMCP",
         khata_mcp: "KhataMCP",
         identity_mcp: "IdentityMCP",
+        payments_mcp: "PaymentsMCP | None" = None,
     ) -> None:
         self.db = get_client()
         self._catalogue = catalogue_mcp
         self._inventory = inventory_mcp
         self._khata = khata_mcp
         self._identity = identity_mcp
+        self._payments = payments_mcp  # injected after PaymentsMCP is constructed
+
+    def set_payments_mcp(self, payments_mcp: "PaymentsMCP") -> None:
+        """Late-bind PaymentsMCP after construction (avoids circular dep in MCPInstances)."""
+        self._payments = payments_mcp
 
     # ------------------------------------------------------------------
     # Draft bill management
@@ -628,19 +635,38 @@ class BillingMCP:
         # 9. Clear active_draft_bill_id
         await self._identity.set_active_draft_bill(telegram_user_id, None)
 
-        # 10. If credit bill → auto-confirm + create khata entry
+        # 10. If credit bill → auto-confirm + create khata entry + record payment
         if is_credit and customer_id:
             # Credit bills are immediately CONFIRMED — the debt is recorded in khata.
             # No cash/UPI payment is expected, so confirm_payment() must NOT be called.
             self.db.rpc("confirm_payment", {"p_bill_id": bill_id}).execute()
 
-            await self._khata.add_credit_entry(
+            khata_entry = await self._khata.add_credit_entry(
                 store_id=store_id,
                 customer_id=customer_id,
                 amount=draft_detail.total_amount,
                 reference_bill_id=bill_id,
                 notes=f"Credit sale — bill {bill_number}",
             )
+
+            # Record KHATA payment row in payments.payments
+            if self._payments:
+                await self._payments.record_payment(
+                    store_id=store_id,
+                    bill_id=bill_id,
+                    bill_number=bill_number,
+                    customer_id=customer_id,
+                    khata_entry_id=khata_entry.entry_id,
+                    paid_amount=0.0,
+                    payment_mode=payment_mode.upper(),
+                    payment_type="KHATA",
+                    payment_status="CONFIRMED",
+                    subtotal=draft_detail.subtotal,
+                    total_gst=round(draft_detail.total_cgst + draft_detail.total_sgst, 2),
+                    bill_amount=draft_detail.total_amount,
+                    change_amount=0.0,
+                    balance_due=draft_detail.total_amount,
+                )
 
         return FinalizedBillResult(
             bill_id=bill_id,
@@ -664,8 +690,9 @@ class BillingMCP:
 
     async def confirm_payment(self, bill_id: str) -> CancelResult:
         """
-        Confirm payment for a PENDING_PAYMENT bill → moves it to CONFIRMED.
-        Call after cash is counted, UPI is received, or credit terms accepted.
+        Flip a PENDING_PAYMENT bill to CONFIRMED via the DB RPC.
+        Called by tool_registry confirm_payment tool AFTER PaymentsMCP.record_payment().
+        Does NOT insert a payments row — that is done by the tool_registry flow.
         """
         resp = self.db.rpc("confirm_payment", {"p_bill_id": bill_id}).execute()
         result = resp.data
@@ -673,6 +700,22 @@ class BillingMCP:
             success=bool(result.get("success", False)),
             message=result.get("message", "Unknown error from confirm_payment RPC."),
         )
+
+    async def get_bill_for_payment(self, bill_id: str) -> dict | None:
+        """
+        Return raw bill row for payment processing.
+        Used by tool_registry to get bill financial details before
+        calling PaymentsMCP.record_payment().
+        """
+        resp = (
+            self.db.schema("billing")
+            .table("bills")
+            .select("id, bill_number, store_id, customer_id, subtotal, total_cgst, total_sgst, total_amount, payment_mode, payment_reference, status, is_credit")
+            .eq("id", bill_id)
+            .limit(1)
+            .execute()
+        )
+        return _one(resp)
 
     async def link_bill_customer(self, bill_id: str, customer_id: str) -> CancelResult:
         """
@@ -770,11 +813,37 @@ class BillingMCP:
         """
         Cancel a PENDING_PAYMENT bill before payment is confirmed.
         Restores stock and reverses any khata credit entry.
+        Also inserts a CANCELLED payment row for audit purposes.
         """
+        # Get bill details before cancelling (for payment row snapshot)
+        bill = await self.get_bill_for_payment(bill_id)
+
         resp = self.db.rpc("cancel_bill", {"p_bill_id": bill_id}).execute()
         result = resp.data
+        success = bool(result.get("success", False))
+
+        # Insert CANCELLED payment row for audit trail
+        if success and bill and self._payments:
+            await self._payments.record_payment(
+                store_id=bill["store_id"],
+                bill_id=bill_id,
+                bill_number=bill.get("bill_number"),
+                customer_id=bill.get("customer_id"),
+                paid_amount=0.0,
+                payment_mode=bill["payment_mode"],
+                payment_type="EXACT",
+                payment_status="CANCELLED",
+                subtotal=float(bill["subtotal"]) if bill.get("subtotal") else None,
+                total_gst=round(
+                    float(bill.get("total_cgst", 0)) + float(bill.get("total_sgst", 0)), 2
+                ),
+                bill_amount=float(bill["total_amount"]) if bill.get("total_amount") else None,
+                change_amount=0.0,
+                balance_due=0.0,
+            )
+
         return CancelResult(
-            success=bool(result.get("success", False)),
+            success=success,
             message=result.get("message", "Unknown error from cancel_bill RPC."),
         )
 
@@ -782,11 +851,58 @@ class BillingMCP:
         """
         Void a CONFIRMED bill — full reversal after payment.
         Restores stock and reverses khata credit entry.
+        Also inserts a REFUNDED payment row for audit purposes.
+
+        Refund amount = paid_amount - change_amount from the original payment row.
+        This ensures only the cash actually received (minus any change already returned)
+        is recorded as refunded — not the full bill amount.
+
+        Examples:
+          Underpayment ₹300 on ₹400 bill  → refund ₹300  (300 - 0)
+          Overpayment ₹400 on ₹350, ₹50 change returned → refund ₹350  (400 - 50)
+          Overpayment ₹500 on ₹400, ₹100 to khata → refund ₹500  (500 - 0)
         """
+        # Get bill details before voiding (for payment row snapshot)
+        bill = await self.get_bill_for_payment(bill_id)
+
         resp = self.db.rpc("void_bill", {"p_bill_id": bill_id}).execute()
         result = resp.data
+        success = bool(result.get("success", False))
+
+        # Insert REFUNDED payment row for audit trail
+        if success and bill and self._payments:
+            # Look up the original payment row to get what the customer actually paid
+            # and how much change was already returned to them.
+            original_payment = await self._payments.get_payment_by_bill(bill_id)
+            if original_payment:
+                # Refund = what customer handed over minus change already given back
+                refund_amount = round(
+                    original_payment.paid_amount - original_payment.change_amount, 2
+                )
+            else:
+                # No payment row (e.g. CREDIT bill voided) — fall back to bill total
+                refund_amount = float(bill["total_amount"]) if bill.get("total_amount") else 0.0
+
+            await self._payments.record_payment(
+                store_id=bill["store_id"],
+                bill_id=bill_id,
+                bill_number=bill.get("bill_number"),
+                customer_id=bill.get("customer_id"),
+                paid_amount=refund_amount,
+                payment_mode=bill["payment_mode"],
+                payment_type="EXACT",
+                payment_status="REFUNDED",
+                subtotal=float(bill["subtotal"]) if bill.get("subtotal") else None,
+                total_gst=round(
+                    float(bill.get("total_cgst", 0)) + float(bill.get("total_sgst", 0)), 2
+                ),
+                bill_amount=float(bill["total_amount"]) if bill.get("total_amount") else None,
+                change_amount=0.0,
+                balance_due=0.0,
+            )
+
         return CancelResult(
-            success=bool(result.get("success", False)),
+            success=success,
             message=result.get("message", "Unknown error from void_bill RPC."),
         )
 

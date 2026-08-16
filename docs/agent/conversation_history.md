@@ -41,6 +41,42 @@ conv:112233445    → Another user's history
 
 ---
 
+## Pending Payment Intent Key
+
+A second Redis key is used to bridge multi-turn over/underpayment resolution:
+
+```
+Key:    pending_payment:{telegram_user_id}
+Type:   String (JSON-encoded dict)
+TTL:    1800 seconds (30 minutes, NOT sliding)
+```
+
+This key is set by `confirm_payment` when it detects an overpayment or underpayment, and cleared once the owner resolves it (via `add_payment_entry` or `add_credit_entry`). It prevents the LLM from hallucinating delta amounts between turns.
+
+**`/new` does NOT clear this key** — the payment intent is tied to a specific bill, not to the conversation context.
+
+```json
+{
+  "intent_type": "OVERPAYMENT",
+  "delta_amount": 70.00,
+  "bill_id": "uuid",
+  "bill_number": "BL-001-20260101-001",
+  "bill_amount": 430.00,
+  "paid_amount": 500.00,
+  "payment_mode": "CASH",
+  "payment_reference": null,
+  "store_id": "uuid",
+  "subtotal": 400.00,
+  "total_gst": 30.00
+}
+```
+
+Methods: `set_pending_payment()`, `get_pending_payment()`, `clear_pending_payment()` in `src/redis/upstash_client.py`.
+
+---
+
+---
+
 ## Data Format
 
 The value is a JSON-encoded list of message objects:

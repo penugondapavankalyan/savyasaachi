@@ -16,6 +16,7 @@ from src.mcp.billing.billing_mcp import BillingMCP
 from src.mcp.khata.khata_mcp import KhataMCP
 from src.mcp.analytics.analytics_mcp import AnalyticsMCP
 from src.mcp.documents.documents_mcp import DocumentsMCP
+from src.mcp.payments.payments_mcp import PaymentsMCP
 
 
 class MCPInstances:
@@ -26,6 +27,7 @@ class MCPInstances:
         Identity → Catalogue → Inventory (needs Identity + Catalogue)
         → Khata → Billing (needs Catalogue + Inventory + Khata + Identity)
         → Analytics → Documents (needs Billing + Analytics + Identity)
+        → Payments (needs Khata — for get_balance in get_payment_history)
     """
 
     def __init__(self) -> None:
@@ -54,6 +56,14 @@ class MCPInstances:
             analytics_mcp=self.analytics,
             identity_mcp=self.identity,
         )
+
+        # Payments last — depends on KhataMCP (for balance reads in history)
+        self.payments = PaymentsMCP(khata_mcp=self.khata)
+
+        # Late-bind PaymentsMCP into BillingMCP now that both are constructed.
+        # BillingMCP was constructed before PaymentsMCP existed (MCPInstances order),
+        # so we inject it here rather than passing at BillingMCP.__init__ time.
+        self.billing.set_payments_mcp(self.payments)
 
 
 # Module-level singleton — reused across warm Lambda invocations

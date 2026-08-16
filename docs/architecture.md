@@ -42,10 +42,10 @@ The system is a serverless, event-driven conversational agent. A Telegram messag
 │  │   │ Identity │ │ Catalogue │ │ Inventory │ │ Billing  │           │ │
 │  │   │   MCP    │ │    MCP    │ │    MCP    │ │   MCP    │           │ │
 │  │   └──────────┘ └───────────┘ └───────────┘ └──────────┘           │ │
-│  │   ┌──────────┐ ┌───────────┐ ┌───────────┐                        │ │
-│  │   │  Khata   │ │ Analytics │ │ Documents │                        │ │
-│  │   │   MCP    │ │    MCP    │ │    MCP    │                        │ │
-│  │   └──────────┘ └───────────┘ └───────────┘                        │ │
+│  │   ┌──────────┐ ┌───────────┐ ┌───────────┐ ┌──────────┐           │ │
+│  │   │  Khata   │ │ Analytics │ │ Documents │ │Payments  │           │ │
+│  │   │   MCP    │ │    MCP    │ │    MCP    │ │   MCP    │           │ │
+│  │   └──────────┘ └───────────┘ └───────────┘ └──────────┘           │ │
 │  └──────────────────────────────┬───────────────────────────────────────┘ │
 │                                  │                                          │
 │  ┌───────────────────────────────▼───────────────────────────────────────┐ │
@@ -60,20 +60,21 @@ The system is a serverless, event-driven conversational agent. A Telegram messag
 │   SUPABASE          │    │   UPSTASH REDIS         │
 │   (PostgreSQL)      │    │   (Serverless)          │
 │                     │    │                         │
-│ • users             │    │ • conv:{user_id}        │
-│ • stores            │    │   → JSON list of msgs   │
-│ • registrations     │    │   → TTL: 24 hours       │
-│ • workflow_state    │    │                         │
-│ • products          │    │ Cleared on /new chat    │
-│ • inventory         │    │ Does NOT store prefs    │
-│ • stock_movements   │    │ (prefs live in Supabase)│
-│ • draft_bills       │    └────────────────────────┘
-│ • draft_bill_items  │
-│ • bills             │
-│ • bill_items        │
-│ • customers         │
-│ • khata_entries     │
+│ • users             │    │ • conv:{user_id}            │
+│ • stores            │    │   → JSON list of msgs       │
+│ • registrations     │    │   → TTL: 24 hours           │
+│ • workflow_state    │    │                             │
+│ • products          │    │ • pending_payment:{user_id} │
+│ • inventory         │    │   → over/underpayment delta │
+│ • stock_movements   │    │   → TTL: 30 minutes         │
+│ • draft_bills       │    │   → cleared once resolved   │
+│ • draft_bill_items  │    │                             │
+│ • bills             │    │ Cleared on /new chat        │
+│ • bill_items        │    │ (conv key only — pending_   │
+│ • customers         │    │  payment not cleared by /new│
+│ • khata_entries     │    └─────────────────────────────┘
 │ • daily_summary     │
+│ • payments          │
 └─────────────────────┘
 ```
 
@@ -143,8 +144,10 @@ The workflow state determines which MCP tools are exposed to the agent. This is 
            │ receive_stock() called at least once
            ▼
 ┌──────────────┐
-│    ACTIVE    │  Tools: all 7 MCP modules
-│              │  Full store operations available
+│    ACTIVE    │  Tools: all 8 MCP modules
+│              │  Intent-based sub-groups (6 groups):
+│              │  BILLING / BILLING_CONFIRM / INVENTORY
+│              │  KHATA / ANALYTICS / CATALOGUE
 └──────────────┘
 ```
 
@@ -156,13 +159,14 @@ Each MCP module owns specific tables and is the **only** module that writes to t
 
 | MCP Module | Owns (Write) | Reads From |
 |---|---|---|
-| **Identity MCP** | users, stores, registrations, workflow_state | — |
-| **Catalogue MCP** | products | stores (read) |
-| **Inventory MCP** | inventory, stock_movements | products, bills (read) |
-| **Billing MCP** | draft_bills, draft_bill_items, bills, bill_items | products, inventory (via inventory_mcp), customers |
-| **Khata MCP** | customers, khata_entries | bills (read) |
-| **Analytics MCP** | daily_summary | bills, bill_items, inventory, stock_movements (read) |
+| **Identity MCP** | `identity`: users, stores, registrations, workflow_state | — |
+| **Catalogue MCP** | `catalogue`: products | stores (read) |
+| **Inventory MCP** | `inventory`: inventory, stock_movements | products, bills (read) |
+| **Billing MCP** | `billing`: draft_bills, draft_bill_items, bills, bill_items | products, inventory (via inventory_mcp), customers |
+| **Khata MCP** | `khata`: customers, khata_entries | bills (read) |
+| **Analytics MCP** | `analytics`: daily_summary | bills, bill_items, inventory, stock_movements (read) |
 | **Documents MCP** | none (generates files, no DB writes) | bills, bill_items, products, analytics data |
+| **Payments MCP** | `payments`: payments | bills, customers, khata_entries (read) |
 
 ---
 
@@ -303,7 +307,11 @@ public                    ← trigger functions, RPCs only (no tables)
 ├── generate_bill_number()
 ├── decrement_stock()
 ├── increment_stock()
-└── get_customer_balance()
+├── get_customer_balance()
+├── confirm_payment()     ← flips bill PENDING_PAYMENT → CONFIRMED
+├── cancel_bill()         ← flips bill to CANCELLED
+├── void_bill()           ← flips bill to VOID
+└── (no new RPC — void_bill_by_number is agent-layer only, calls void_bill() after resolving bill_number→UUID)
 
 identity                  ← owned by Identity MCP
 ├── users
@@ -330,6 +338,9 @@ khata                     ← owned by Khata MCP
 
 analytics                 ← owned by Analytics MCP
 └── daily_summary
+
+payments                  ← owned by Payments MCP (append-only, immutable)
+└── payments              ← one row per payment event (table name = schema name)
 ```
 
 ### Supabase: Exposing Non-public Schemas
@@ -339,7 +350,7 @@ Supabase's PostgREST (REST API) only exposes `public` by default. To expose all 
 1. Go to **Supabase Dashboard → Project Settings → API**
 2. Under **"Exposed schemas"**, add each schema name:
    ```
-   identity, catalogue, inventory, billing, khata, analytics
+   identity, catalogue, inventory, billing, khata, analytics, payments
    ```
 3. Click Save (this restarts PostgREST automatically)
 
@@ -380,9 +391,65 @@ PostgreSQL supports FKs across schemas natively. The key cross-schema FKs in thi
 | `khata.khata_entries.customer_id` | `billing.customers.id` | Cross-schema |
 | `khata.khata_entries.reference_bill_id` | `billing.bills.id` | Cross-schema |
 | `analytics.daily_summary.store_id` | `identity.stores.id` | Cross-schema |
+| `payments.payments.store_id` | `identity.stores.id` | Cross-schema |
+| `payments.payments.bill_id` | `billing.bills.id` | Cross-schema |
+| `payments.payments.customer_id` | `billing.customers.id` | Cross-schema |
+| `payments.payments.khata_entry_id` | `khata.khata_entries.id` | Cross-schema |
 
 ---
 
+
+---
+
+## Payment Flow Architecture
+
+The payment system records every financial event as an immutable row in `payments.payments`. There is no "update payment" — each state change creates a new row.
+
+### Payment Types and When They Are Inserted
+
+| Payment Type | Trigger | `bill_id` | `khata_entry_id` |
+|---|---|---|---|
+| `EXACT` | `confirm_payment` tool (diff = 0) | ✅ | null |
+| `OVERPAYMENT` | `add_payment_entry(amount=None)` after owner confirms khata | ✅ | ✅ |
+| `UNDERPAYMENT` | `add_credit_entry(amount=None)` after owner confirms khata | ✅ | ✅ |
+| `KHATA` | `finalize_bill` (credit sale) | ✅ | ✅ |
+| `KHATA_SETTLE` | `add_payment_entry(amount=<explicit>)` standalone | null | ✅ |
+| `CANCELLED` | `cancel_bill` | ✅ | null |
+| `REFUNDED` | `void_bill` | ✅ | null |
+
+### Over/Underpayment Resolution Flow (Multi-Turn)
+
+```
+Turn 1: Owner says "paid ₹500" (bill total was ₹430)
+   → confirm_payment(paid_amount=500)
+      1. Bill flipped PENDING_PAYMENT → CONFIRMED via RPC
+      2. Overpayment detected (diff = +₹70)
+      3. Redis key set: pending_payment:{tuid} = {intent_type: OVERPAYMENT,
+         delta_amount: 70, bill_id: ..., bill_amount: 430, paid_amount: 500, ...}
+         TTL: 30 minutes
+      4. Payment row NOT inserted yet (need khata_entry_id)
+      5. Agent asks owner: "₹70 extra. Return change or add to khata?"
+
+Turn 2: Owner says "add to khata, Ramesh"
+   → get_customer("Ramesh") → customer_id
+   → add_payment_entry(customer_id, amount=None)
+      1. Redis key read: delta = ₹70
+      2. khata_mcp.add_payment_entry(amount=70) → khata_entry_id
+      3. payments.record_payment(type=OVERPAYMENT, paid=500,
+         change=70, khata_entry_id=...) → payment row inserted
+      4. Redis key deleted
+      5. Agent confirms to owner
+```
+
+### `confirm_payment` Tool Invariant
+
+`confirm_payment(paid_amount)` in `tool_registry.py` is mandatory for all CASH/UPI bills after finalization. It:
+1. Calls `BillingMCP.confirm_payment(bill_id)` → DB RPC flips bill status
+2. Classifies payment type (EXACT / OVERPAYMENT / UNDERPAYMENT)
+3. For EXACT: inserts payment row immediately
+4. For OVER/UNDER: stores delta in Redis; payment row is deferred to resolution turn
+
+**`confirm_payment` must NOT be called after a CREDIT bill** — credit bills are auto-confirmed at `finalize_bill` time.
 
 ---
 

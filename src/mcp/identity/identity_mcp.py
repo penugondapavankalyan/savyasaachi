@@ -116,7 +116,9 @@ class IdentityMCP:
         # ── Guardrails ──────────────────────────────────────────────────
         telegram_username = clean_optional_str(telegram_username)
         first_name = clean_optional_str(first_name)
+        first_name = first_name.title() if first_name else first_name
         last_name = clean_optional_str(last_name)
+        last_name  = last_name.title() if last_name else last_name
 
         # 1. Upsert user — only update name/username fields if they are non-None
         # (prevents overwriting a known name with None on subsequent calls)
