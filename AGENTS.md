@@ -43,7 +43,8 @@ There is no `pytest` or linter config. Validation is performed via local runners
 - All tools in `src/agent/tool_registry.py` are local async closures that close over `tuid` (telegram_user_id) and `store_id` from `StoreContext`.
 - The LLM NEVER receives or passes `store_id` / `telegram_user_id`. Any new tool must follow this pattern.
 - Tool docstrings ARE the LLM-facing API spec — write them as precise instructions to the model.
-- **Mutable list cells**: `_draft_id_cell = [value]`, `_bill_id_cell = [value]`, `_last_confirmed_bill_cell = [value]` are lists (not plain variables) to allow in-place mutation visible across sibling closures in the same request.
+- **Mutable list cells**: `_draft_id_cell = [value]`, `_bill_id_cell = [value]`, `_last_confirmed_bill_cell = [value]`, `_last_added_product_id_cell = [value]` are lists (not plain variables) to allow in-place mutation visible across sibling closures in the same request.
+- **`_last_added_product_id_cell`**: written by `add_product()` immediately after a successful catalogue insert. `receive_stock()` always prefers this cell over whatever UUID the LLM passes — prevents the model from hallucinating a stale product_id from a previous session and sending it to the DB. If the cell is populated and differs from the LLM-passed value, the cell wins. If the cell is empty and the LLM-passed value is not a valid UUID, `receive_stock()` returns a clear error.
 - For ACTIVE state, tools are split into 6 intent groups: **BILLING / BILLING_CONFIRM / INVENTORY / KHATA / ANALYTICS / CATALOGUE**, max ~12 tools per request. New tools must go into the correct group(s). Default group is BILLING.
 - `detect_intent()` takes `has_active_draft` and `last_assistant_msg` — payment-mode words ("credit", "cash", "upi") during an active billing session route to BILLING, not KHATA.
 - `BILLING_CONFIRM` routing is **two-tiered** in `detect_intent()`:

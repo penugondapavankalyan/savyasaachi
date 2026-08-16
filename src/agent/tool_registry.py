@@ -502,6 +502,9 @@ def _build_active_tools(
             pass
     _bill_id_cell: list[str | None] = [_pending_bill_id]
     _last_confirmed_bill_cell: list[str | None] = [_last_confirmed_bill_id]
+    # _last_added_product_id_cell: written by add_product(), read by receive_stock().
+    # Prevents the LLM from hallucinating a stale product_id across turns.
+    _last_added_product_id_cell: list[str | None] = [None]
 
     # ── Shared lookup tools (all intents) ───────────────────────────────
 
@@ -770,7 +773,17 @@ def _build_active_tools(
             reorder_level: float | None = None, gst_rate: float | None = None,
             hsn_code: str | None = None,
         ) -> str:
-            """Update any field of an existing product. Use full product_id from list/search."""
+            """
+            Update any field of an existing product.
+            product_id MUST be a full UUID from list_products or search_products.
+            NEVER pass a placeholder like 'PROD-001' — call list_products() first if you don't have the UUID.
+            """
+            from src.utils.guardrails import clean_uuid
+            if not clean_uuid(product_id):
+                return (
+                    f"ERROR: '{product_id}' is not a valid product_id UUID. "
+                    "Call list_products() or search_products() first to get the real UUID."
+                )
             result = await mcps.catalogue.update_product_details(
                 store_id=store_id, product_id=product_id,
                 name=name, brand=brand, unit=unit, is_loose=is_loose,
@@ -2278,10 +2291,20 @@ def _build_active_tools(
         """
         Add a new product to the catalogue during billing when it is not found by search_products.
         Use this ONLY when search_products returns no results for the product.
-        - gst_rate: MANDATORY. Loose → pass 0. Branded → MUST be 5 / 12 / 18 / 28.
-          NEVER pass 0 for branded items — ask the owner for the correct rate first.
-        After adding, ALWAYS call receive_stock to add initial stock before adding to bill.
-        Returns product_id in the result — use it for receive_stock and add_item_to_draft.
+
+        ⚠️ STOP — before calling this tool you MUST ask the owner ONE question collecting
+        ALL of the following that are not already known:
+          • Is it loose (sold by weight/volume) or branded/packaged?
+          • Brand name (e.g. "Lays", "Tata", "Amul") — or confirm no brand for loose items
+          • Unit: KG / L / PIECE / PACKET / DOZEN / BUNDLE / BAG / BOX / BOTTLE
+          • Cost price (what the shop paid per unit)
+          • MRP / selling price per unit
+          • GST rate: 0 for loose items; 5 / 12 / 18 / 28 for branded — NEVER guess
+          • Reorder level (minimum stock before alert)
+
+        NEVER call this tool with assumed or guessed values for any of the above.
+        After adding, ALWAYS call receive_stock() to add initial stock before adding to bill.
+        The product_id is saved server-side — receive_stock() resolves it automatically.
         """
         from src.mcp.catalogue.models import AddProductResult
         result: AddProductResult = await mcps.catalogue.add_product(
@@ -2289,17 +2312,30 @@ def _build_active_tools(
             cost_price=cost_price, mrp=mrp, reorder_level=reorder_level,
             brand=brand, hsn_code=hsn_code, gst_rate=gst_rate, telegram_user_id=tuid,
         )
-        return result.message + f"\n[product_id={result.product_id}] — Ask owner for initial stock quantity, then call receive_stock, then add_item_to_draft."
+        _last_added_product_id_cell[0] = result.product_id
+        return result.message + f"\n[product_id={result.product_id}] — Ask owner for initial stock quantity, then call receive_stock(), then add_item_to_draft()."
 
     async def receive_stock(product_id: str, quantity: float, notes: str | None = None) -> str:
         """
         Add initial stock for a newly added product before it can be billed.
-        - product_id: from add_product result
-        - quantity: initial stock quantity (REQUIRED — must ask owner)
+        - product_id: pass the product_id returned by add_product().
+          The server resolves it automatically — pass any value if unsure.
+        - quantity: initial stock quantity (REQUIRED — must ask owner if not stated)
         """
+        from src.utils.guardrails import clean_uuid as _clean_uuid
         from src.mcp.inventory.models import ReceiveStockResult
+        # Always prefer the server-authoritative product_id written by add_product()
+        # this turn or in a recent turn — prevents stale LLM-hallucinated UUIDs reaching DB.
+        resolved_pid: str | None = product_id if _clean_uuid(product_id) else None
+        if _last_added_product_id_cell[0] and resolved_pid != _last_added_product_id_cell[0]:
+            resolved_pid = _last_added_product_id_cell[0]
+        if not resolved_pid:
+            return (
+                "ERROR: No product_id available. Call add_product() first, "
+                "then call receive_stock() with the returned product_id."
+            )
         result: ReceiveStockResult = await mcps.inventory.receive_stock(
-            store_id=store_id, product_id=product_id,
+            store_id=store_id, product_id=resolved_pid,
             quantity=quantity, notes=notes, telegram_user_id=tuid,
         )
         return result.message
