@@ -378,6 +378,10 @@ class CatalogueMCP:
         Substring search on name and brand.
         Also tries stemmed variants of the query so that plural/suffix forms
         (e.g. 'pencils', 'sugars', 'biscuits') match the stored singular name.
+        For multi-word queries (e.g. 'apsara pencil'), also tries a cross-field
+        pass: each word is matched against name while the remaining words are
+        checked against brand in-memory, so 'apsara pencil' finds a product
+        named 'Pencil' with brand 'Apsara'.
         Returns up to 10 results ordered by name.
         """
         # Build a set of search terms: original query + stemmed variants.
@@ -395,13 +399,8 @@ class CatalogueMCP:
         seen_ids: set[str] = set()
         results: list[dict] = []
 
-        for term in terms:
-            # Build a FRESH query each iteration — the supabase-py query builder
-            # mutates its internal params object in-place via .add().  Reusing the
-            # same base_q across iterations would accumulate ilike filters as AND
-            # conditions (e.g. name=ilike.%pencils% AND name=ilike.%pencil%) which
-            # can never both be satisfied simultaneously, always returning 0 rows.
-            search_term = f"%{term}%"
+        def _base_q() -> object:
+            """Return a fresh base query (never reuse — builder mutates in-place)."""
             q = (
                 self.db.schema("catalogue")
                 .table("products")
@@ -410,7 +409,16 @@ class CatalogueMCP:
             )
             if active_only:
                 q = q.eq("is_active", True)
-            resp = q.ilike("name", search_term).limit(10).execute()
+            return q
+
+        for term in terms:
+            # Build a FRESH query each iteration — the supabase-py query builder
+            # mutates its internal params object in-place via .add().  Reusing the
+            # same base_q across iterations would accumulate ilike filters as AND
+            # conditions (e.g. name=ilike.%pencils% AND name=ilike.%pencil%) which
+            # can never both be satisfied simultaneously, always returning 0 rows.
+            search_term = f"%{term}%"
+            resp = _base_q().ilike("name", search_term).limit(10).execute()
             for row in (resp.data or []):
                 if row["id"] not in seen_ids:
                     seen_ids.add(row["id"])
@@ -423,10 +431,7 @@ class CatalogueMCP:
             for term in terms:
                 search_term = f"%{term}%"
                 resp2 = (
-                    self.db.schema("catalogue")
-                    .table("products")
-                    .select("*")
-                    .eq("store_id", store_id)
+                    _base_q()
                     .ilike("brand", search_term)
                     .limit(10)
                     .execute()
@@ -437,6 +442,32 @@ class CatalogueMCP:
                         results.append(row)
                 if results:
                     break
+
+        # Cross-field pass for multi-word queries (e.g. "apsara pencil"):
+        # Try each individual word as a name match, then verify in-memory that
+        # at least one of the remaining words appears in the brand field.
+        # This catches products like name="Pencil", brand="Apsara" which the
+        # whole-phrase passes above would miss entirely.
+        if not results:
+            words = q_lower.split()
+            if len(words) > 1:
+                for name_word in words:
+                    other_words = [w for w in words if w != name_word]
+                    resp3 = (
+                        _base_q()
+                        .ilike("name", f"%{name_word}%")
+                        .limit(50)
+                        .execute()
+                    )
+                    for row in (resp3.data or []):
+                        if row["id"] in seen_ids:
+                            continue
+                        brand_val = (row.get("brand") or "").lower()
+                        if any(w in brand_val for w in other_words):
+                            seen_ids.add(row["id"])
+                            results.append(row)
+                    if results:
+                        break
 
         return [_row_to_product(r) for r in results]
 

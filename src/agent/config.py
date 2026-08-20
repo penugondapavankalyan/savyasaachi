@@ -9,9 +9,9 @@ from pydantic import BaseModel
 
 
 class AgentConfig(BaseModel):
-    llm_provider: str = "groq"           # 'groq' | 'ollama'
+    llm_provider: str = "ollama"         # 'ollama' only (groq removed)
     llm_model: str = "llama-3.3-70b-versatile"
-    groq_api_key: Optional[str] = None
+    # groq_api_key: Optional[str] = None  # unused — Groq removed
     ollama_base_url: str = "http://localhost:11434"
     max_history_messages: int = 20
     draft_bill_ttl_hours: int = 4

@@ -329,6 +329,50 @@ class PaymentsMCP:
             message="",
         )
 
+    async def get_first_confirmed_payment_by_bill(
+        self,
+        bill_id: str,
+    ) -> Optional[PaymentResult]:
+        """
+        Return the earliest CONFIRMED payment row for a given bill_id.
+        Used by void_bill to get the original payment details (avoids
+        picking up a later REFUNDED/CANCELLED audit row for the same bill).
+        Returns None if no CONFIRMED row exists.
+        """
+        resp = (
+            self.db.schema("payments")
+            .table("payments")
+            .select("*")
+            .eq("bill_id", bill_id)
+            .eq("payment_status", "CONFIRMED")
+            .order("created_at", desc=False)
+            .limit(1)
+            .execute()
+        )
+        row = _one(resp)
+        if not row:
+            return None
+        return PaymentResult(
+            payment_id=row["payment_id"],
+            bill_id=row.get("bill_id"),
+            bill_number=None,
+            store_id=row["store_id"],
+            customer_id=row.get("customer_id"),
+            khata_entry_id=row.get("khata_entry_id"),
+            subtotal=float(row["subtotal"]) if row.get("subtotal") else None,
+            total_gst=float(row["total_gst"]) if row.get("total_gst") else None,
+            bill_amount=float(row["bill_amount"]) if row.get("bill_amount") else None,
+            paid_amount=float(row["paid_amount"]),
+            payment_mode=row["payment_mode"],
+            payment_reference=row.get("payment_reference"),
+            payment_type=row["payment_type"],
+            payment_status=row["payment_status"],
+            change_amount=float(row["change_amount"]),
+            balance_due=float(row["balance_due"]),
+            created_at=row["created_at"],
+            message="",
+        )
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------

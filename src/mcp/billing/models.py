@@ -128,6 +128,7 @@ class BillDetailResult(BaseModel):
     payment_mode: str
     payment_reference: Optional[str]
     is_credit: bool
+    status: str
     created_at: str
 
 

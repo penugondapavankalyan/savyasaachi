@@ -213,12 +213,15 @@ def _build_pending_catalogue_tools(
         )
         if not products:
             return f"No products found matching '{query}'."
-        lines = [f"Products matching '{query}':"]
+        lines = [
+            f"Products matching '{query}' "
+            f"[internal — product_ids below are for tool calls only, NEVER show to owner]:"
+        ]
         for p in products:
             brand_str = f" ({p.brand})" if p.brand else ""
             loose_str = "LOOSE" if p.is_loose else "BRANDED"
             lines.append(
-                f"  product_id={p.product_id} | {p.name}{brand_str} | {loose_str} | {p.unit} | MRP Rs.{p.mrp}"
+                f"  [internal product_id={p.product_id}] {p.name}{brand_str} | {loose_str} | {p.unit} | MRP Rs.{p.mrp}"
             )
         return "\n".join(lines)
 
@@ -330,12 +333,15 @@ def _build_pending_inventory_tools(
         )
         if not products:
             return f"No products found matching '{query}'."
-        lines = [f"Products matching '{query}' (use the full product_id when calling receive_stock):"]
+        lines = [
+            f"Products matching '{query}' "
+            f"[internal — product_ids below are for tool calls only, NEVER show to owner]:"
+        ]
         for p in products:
             brand_str = f" ({p.brand})" if p.brand else ""
             loose_str = "LOOSE" if p.is_loose else "BRANDED"
             lines.append(
-                f"  product_id={p.product_id} | {p.name}{brand_str} | {loose_str} | {p.unit}"
+                f"  [internal product_id={p.product_id}] {p.name}{brand_str} | {loose_str} | {p.unit}"
             )
         return "\n".join(lines)
 
@@ -368,10 +374,25 @@ def _build_pending_inventory_tools(
         hsn_code: str | None = None,
     ) -> str:
         """
-        Add a new product to catalogue (use only if product is missing from catalogue).
-        - gst_rate: MANDATORY. Loose → pass 0. Branded → MUST be 5 / 12 / 18 / 28.
-          NEVER pass 0 for branded items — ask the owner for the rate first.
-        After adding, ALWAYS ask the owner for quantity and call receive_stock.
+        Add a new product to the catalogue.
+
+        ⚠️ STOP — before calling this tool you MUST have ALL of the following from the owner.
+        Ask for anything not yet provided — ONE question covering all missing fields:
+          • Is it LOOSE (sold by weight/volume, e.g. rice, oil) or BRANDED/PACKAGED (e.g. Parle-G, Tata Salt)?
+            NEVER assume — always ask explicitly.
+          • Unit: KG / G / L / ML / PIECE / PACKET / DOZEN / BUNDLE
+          • Cost price (what the shop paid per unit, in ₹)
+          • MRP / selling price per unit (in ₹)
+          • GST rate: LOOSE items → always 0. BRANDED items → MUST be exactly 5 / 12 / 18 / 28 — NEVER guess, NEVER use 0 for branded.
+          • Reorder level (minimum stock quantity before alert)
+          • Brand name if branded (e.g. "Parry's", "Tata") — pass None for loose items
+          • Initial stock quantity (how many units the shop has right now)
+
+        NEVER invent or assume is_loose, gst_rate, brand, or any other field.
+        NEVER ask for description, category, or any field not listed above — they do not exist.
+        ⚠️ SAME TURN RULE: once you have ALL fields including initial stock quantity,
+        call add_product() AND receive_stock() in the SAME turn — do NOT split across turns.
+        The product_id is saved server-side — receive_stock() resolves it automatically.
         """
         from src.mcp.catalogue.models import AddProductResult
         result: AddProductResult = await mcps.catalogue.add_product(
@@ -387,7 +408,7 @@ def _build_pending_inventory_tools(
             gst_rate=gst_rate,
             telegram_user_id=tuid,
         )
-        return result.message + f"\n[product_id={result.product_id}] — Now ask for quantity to receive_stock."
+        return result.message + f"\n[internal product_id={result.product_id} — use for receive_stock, do NOT show to owner]"
 
     async def update_product_details(
         product_id: str,
@@ -509,19 +530,39 @@ def _build_active_tools(
     # ── Shared lookup tools (all intents) ───────────────────────────────
 
     async def search_products(query: str) -> str:
-        """Search for a product by name. Returns full product_id and details."""
+        """
+        Search for a product by name. Returns full product_id and details.
+
+        QUERY RULES:
+        - Search by product name ONLY — never combine name + brand in query.
+          CORRECT:   search_products(query='Pencil')
+          INCORRECT: search_products(query='Pencil Natraj')  ← brand is NOT part of name
+        - If this tool already returned results earlier this turn or the previous turn,
+          do NOT call it again — use the product_id already in your context.
+        - If the owner disambiguates from a prior multi-result response (e.g. says 'natraj'
+          after you listed Apsara and Natraj pencils), pick the matching product_id from
+          that earlier result and proceed directly to add_item_to_draft — do NOT re-search.
+        """
         from src.mcp.catalogue.models import ProductResult
         products: list[ProductResult] = await mcps.catalogue.search_products(
             store_id=store_id, query=query
         )
         if not products:
-            return f"No products found matching '{query}'."
-        lines = [f"Products matching '{query}':"]
+            return (
+                f"No products found matching '{query}'.\n"
+                f"⚠️ STOP — ask the owner first: "
+                f"'{query} is not in the catalogue. Do you want to add it, or skip it?'\n"
+                f"Wait for the owner's answer before collecting any product details."
+            )
+        lines = [
+            f"Products matching '{query}' "
+            f"[internal — product_ids below are for tool calls only, NEVER show to owner]:"
+        ]
         for p in products:
             brand_str = f" ({p.brand})" if p.brand else ""
             loose_str = "LOOSE" if p.is_loose else "BRANDED"
             lines.append(
-                f"  product_id={p.product_id} | {p.name}{brand_str} | {loose_str} | {p.unit} | MRP Rs.{p.mrp} | GST {p.gst_rate}%"
+                f"  [internal product_id={p.product_id}] {p.name}{brand_str} | {loose_str} | {p.unit} | MRP Rs.{p.mrp} | GST {p.gst_rate}%"
             )
         return "\n".join(lines)
 
@@ -533,12 +574,15 @@ def _build_active_tools(
         )
         if not products:
             return "Catalogue is empty."
-        lines = ["Catalogue:"]
+        lines = [
+            "Catalogue "
+            "[internal — product_ids below are for tool calls only, NEVER show to owner]:"
+        ]
         for p in products:
             brand_str = f" ({p.brand})" if p.brand else ""
             loose_str = "LOOSE" if p.is_loose else "BRANDED"
             lines.append(
-                f"  product_id={p.product_id} | {p.name}{brand_str} | {loose_str} | {p.unit} | MRP Rs.{p.mrp} | GST {p.gst_rate}%"
+                f"  [internal product_id={p.product_id}] {p.name}{brand_str} | {loose_str} | {p.unit} | MRP Rs.{p.mrp} | GST {p.gst_rate}%"
             )
         return "\n".join(lines)
 
@@ -721,8 +765,10 @@ def _build_active_tools(
         - date_str: date in YYYY-MM-DD format (default: today in IST).
           Convert natural language dates like '13th august' → '2026-08-13' yourself.
 
-        Returns bill number, total amount, payment mode, item count, and bill_id for each bill.
-        To generate a PDF for one of these bills, call generate_invoice_pdf(bill_id).
+        Returns bill number, total amount, payment mode, and item count for each bill.
+        Lines prefixed [internal] contain bill_id for tool use only — NEVER show to owner.
+        To generate a PDF for one of these bills, call generate_invoice_pdf with the
+        bill_id from the [internal] line that follows each bill row.
         """
         from src.utils.ist import today_ist as _today_ist
         target = date_str or _today_ist().isoformat()
@@ -734,9 +780,28 @@ def _build_active_tools(
             credit_tag = " [CREDIT]" if b.is_credit else ""
             lines.append(
                 f"  {b.bill_number} | ₹{b.total_amount:.2f} | "
-                f"{b.payment_mode}{credit_tag} | {b.item_count} items | "
-                f"bill_id={b.bill_id}"
+                f"{b.payment_mode}{credit_tag} | {b.item_count} items"
             )
+            lines.append(f"  [internal bill_id={b.bill_id} — for generate_invoice_pdf only, NEVER show to owner]")
+        return "\n".join(lines)
+
+    async def list_customers_with_balances() -> str:
+        """
+        List ALL customers with their current outstanding khata balances.
+
+        USE WHEN: owner asks 'list all balances', 'all khata', 'show all customers',
+        'who owes money', 'all outstanding balances', 'list khata'.
+
+        Returns every customer with their signed balance and direction.
+        """
+        result = await mcps.khata.list_customers_with_balances(store_id=store_id)
+        if not result:
+            return "No customers found."
+        lines = ["| Name | Phone | Balance | Owes | customer_id |",
+                 "|------|-------|---------|------|-------------|"]
+        for c in result:
+            bal, owes = _balance_cols(c.balance)
+            lines.append(f"| {c.name} | {c.phone} | {bal} | {owes} | {c.customer_id} |")
         return "\n".join(lines)
 
     # ── CATALOGUE intent ─────────────────────────────────────────────────
@@ -754,7 +819,14 @@ def _build_active_tools(
                 cost_price=cost_price, mrp=mrp, reorder_level=reorder_level,
                 brand=brand, hsn_code=hsn_code, gst_rate=gst_rate, telegram_user_id=tuid,
             )
-            return result.message + f"\n[product_id={result.product_id}] — MANDATORY: If the owner provided initial stock quantity in their prompt, IMMEDIATELY call receive_stock(product_id, initial_stock_qty) in this same turn!"
+            return (
+                result.message
+                + f"\n[product_id={result.product_id}]"
+                + "\nMANDATORY NEXT STEPS (same turn):"
+                + "\n  1. If owner provided initial stock quantity → call receive_stock(product_id, qty) NOW."
+                + "\n  2. If this product was requested for the current bill → after receive_stock, call check_availability then add_item_to_draft(product_id, requested_qty)."
+                + "\n  Do NOT skip add_item_to_draft — the product must be added to the bill explicitly."
+            )
 
         async def receive_stock(product_id: str, quantity: float, notes: str | None = None) -> str:
             """Record received stock for a product."""
@@ -821,8 +893,57 @@ def _build_active_tools(
             )
             return result.message
 
+        async def check_availability(product_id: str, quantity: float) -> str:
+            """
+            Check if a product has enough stock for a sale.
+            product_id MUST be a full UUID from search_products or list_products.
+            """
+            from src.utils.guardrails import clean_uuid
+            if not clean_uuid(product_id):
+                return (
+                    f"ERROR: '{product_id}' is not a valid product_id. "
+                    "Call search_products(query='<name>') first to get the real UUID."
+                )
+            result = await mcps.inventory.check_availability(
+                store_id=store_id, product_id=product_id, requested_quantity=quantity
+            )
+            return str(result)
+
+        async def add_item_to_draft(product_id: str, quantity: float) -> str:
+            """
+            Add a product to the active bill draft.
+            - product_id: FULL UUID from search_products or list_products — never invent.
+            - quantity: how many units the owner wants to sell.
+            Do NOT pass draft_bill_id — resolved automatically from the active draft.
+            Only call this after add_product + receive_stock when adding a new product mid-billing.
+            """
+            from src.utils.guardrails import clean_uuid
+            if not clean_uuid(product_id):
+                return (
+                    f"ERROR: '{product_id}' is not a valid product_id. "
+                    "Call search_products(query='<name>') first to get the real UUID."
+                )
+            resolved_id = _draft_id_cell[0]
+            if not resolved_id:
+                return "ERROR: No active draft bill. Call create_draft_bill() first."
+            try:
+                result = await mcps.billing.add_item_to_draft(
+                    draft_bill_id=resolved_id, product_id=product_id,
+                    quantity=quantity
+                )
+            except ValueError as e:
+                msg = str(e)
+                if "not found" in msg.lower():
+                    return (
+                        f"ERROR: product_id '{product_id}' does not exist in this store's catalogue. "
+                        "Call search_products(query='<item name>') to get the correct product_id."
+                    )
+                return f"ERROR: {msg}"
+            return str(result)
+
         return [search_products, list_products, add_product, receive_stock, update_product_details,
-                deactivate_product, update_store, update_owner_name]
+                deactivate_product, update_store, update_owner_name,
+                check_availability, add_item_to_draft]
 
     # ── INVENTORY intent ─────────────────────────────────────────────────
 
@@ -882,7 +1003,7 @@ def _build_active_tools(
                 store_id=store_id, name=name, phone=phone
             )
             # Return only the human message — avoids LLM misreading raw balance float
-            return f"customer_id={result.customer_id}\n{result.message}"
+            return f"[internal customer_id={result.customer_id} — use for finalize_bill/add_credit_entry, do NOT show to owner]\n{result.message}"
 
         async def get_customer(name_or_phone: str) -> str:
             """Look up a customer by name or phone number."""
@@ -891,11 +1012,21 @@ def _build_active_tools(
             )
             if not result.found:
                 return f"No customer found matching '{name_or_phone}'."
-            lines = []
-            for c in result.customers:
-                lines.append(
-                    f"customer_id={c.customer_id} | {c.name} ({c.phone}) | {_balance_summary(c.current_balance, c.name)}"
+            if len(result.customers) == 1:
+                c = result.customers[0]
+                bal, owes = _balance_cols(c.current_balance)
+                return (
+                    f"customer_id={c.customer_id} | {c.name} ({c.phone}) | "
+                    f"balance={bal} | owes={owes}"
                 )
+            lines = [
+                f"Multiple customers found for '{name_or_phone}':",
+                "| Name | Phone | Balance | Owes | customer_id |",
+                "|------|-------|---------|------|-------------|",
+            ]
+            for c in result.customers:
+                bal, owes = _balance_cols(c.current_balance)
+                lines.append(f"| {c.name} | {c.phone} | {bal} | {owes} | {c.customer_id} |")
             return "\n".join(lines)
 
         async def add_credit_entry(customer_id: str, amount: float, notes: str | None = None) -> str:
@@ -904,7 +1035,41 @@ def _build_active_tools(
             Use this ONLY when the customer has taken something without paying (amount_delta = +positive).
             DO NOT use this when a customer pays more than they owe — use add_payment_entry instead.
             Example: customer takes ₹200 of groceries on credit → add_credit_entry(amount=200)
+
+            ⚠️ IMPORTANT — if there is an active draft bill (items were added this session):
+            DO NOT call this tool. Call finalize_bill(payment_mode='CREDIT', is_credit=True,
+            customer_id=<uuid>) instead — it creates the bill record AND the khata entry together.
+            Calling add_credit_entry on an open draft leaves the draft open and creates a khata entry
+            with no bill. (This tool will self-heal internally, but always use finalize_bill.)
             """
+            # ── Self-heal: open draft bill exists but model called add_credit_entry directly ──
+            # The correct path is finalize_bill(payment_mode='CREDIT', is_credit=True, customer_id=...)
+            # which creates the bill, khata entry, and payment row atomically.
+            # If the model skipped finalize_bill, do it now so no bill or payment row is lost.
+            if _draft_id_cell[0] is not None:
+                from src.utils.guardrails import clean_uuid
+                if not clean_uuid(customer_id):
+                    return "ERROR: customer_id must be a valid UUID. Call get_customer() or add_customer() first."
+                draft_id = _draft_id_cell[0]
+                finalized = await mcps.billing.finalize_bill(
+                    draft_bill_id=draft_id,
+                    payment_mode="CREDIT",
+                    telegram_user_id=tuid,
+                    is_credit=True,
+                    customer_id=customer_id,
+                )
+                _draft_id_cell[0] = None
+                _bill_id_cell[0] = finalized.bill_id
+                _last_confirmed_bill_cell[0] = finalized.bill_id
+                return (
+                    f"bill_number={finalized.bill_number}\n"
+                    f"status=CONFIRMED\n"
+                    f"total=₹{finalized.total_amount:.2f} | payment_mode=CREDIT\n"
+                    f"{finalized.message}\n"
+                    f"✅ Bill is CONFIRMED. The khata entry has been recorded. "
+                    f"Inform the owner and ask if they need anything else."
+                )
+
             # Safety net: if there is a pending Redis UNDERPAYMENT intent (routing landed here
             # instead of BILLING_CONFIRM), run the full resolution — confirm bill, record payment
             # row, link customer — so the DB stays consistent regardless of intent routing.
@@ -1044,18 +1209,6 @@ def _build_active_tools(
                 store_id=store_id, customer_id=customer_id
             )
             return str(result)
-
-        async def list_customers_with_balances() -> str:
-            """List all customers with their current outstanding balances."""
-            result = await mcps.khata.list_customers_with_balances(store_id=store_id)
-            if not result:
-                return "No customers found."
-            lines = []
-            for c in result:
-                lines.append(
-                    f"customer_id={c.customer_id} | {c.name} ({c.phone}) | {_balance_summary(c.balance, c.name)}"
-                )
-            return "\n".join(lines)
 
         return [search_products, add_customer, get_customer, add_credit_entry,
                 add_payment_entry, get_balance, get_khata_history, list_customers_with_balances,
@@ -1210,6 +1363,16 @@ def _build_active_tools(
         ONLY call this if ACTIVE BILL in the system prompt shows 'None'.
         If a draft is already open (ACTIVE BILL shows a UUID), skip this — use the existing draft.
         """
+        # Guard: if a draft already exists in this session, return it unchanged.
+        # Do NOT create a second draft or re-add items — the existing draft is the active bill.
+        if _draft_id_cell[0]:
+            existing_id = _draft_id_cell[0]
+            return (
+                f"⚠️ A draft bill is already open (draft_bill_id={existing_id}).\n"
+                f"Do NOT call create_draft_bill again — use the existing draft.\n"
+                f"To see current items and total, call get_draft_bill().\n"
+                f"To proceed to checkout, call get_draft_bill() then finalize_and_pay() or finalize_bill()."
+            )
         result = await mcps.billing.create_draft_bill(
             store_id=store_id, telegram_user_id=tuid
         )
@@ -1217,8 +1380,10 @@ def _build_active_tools(
         # within this same request, even though they were captured before the draft existed.
         _draft_id_cell[0] = result.draft_bill_id
         return (
-            f"draft_bill_id={result.draft_bill_id}\n"
-            f"status={result.status} | items={result.item_count} | total=₹{result.estimated_total:.2f}"
+            f"✅ New bill started.\n"
+            f"[internal draft_bill_id={result.draft_bill_id} — DO NOT show to owner]\n"
+            f"status={result.status} | items={result.item_count} | total=₹{result.estimated_total:.2f}\n"
+            f"Ask the owner: 'What items would you like to add?'"
         )
 
     async def add_item_to_draft(product_id: str, quantity: float) -> str:
@@ -1227,6 +1392,12 @@ def _build_active_tools(
         - product_id: FULL UUID from search_products or list_products — never invent.
         - quantity: how many units the owner wants to sell.
         Do NOT pass draft_bill_id — resolved automatically from the active draft.
+
+        DISAMBIGUATION RULE:
+        If search_products returned multiple results and the owner picks one by brand or
+        partial name (e.g. "natraj", "apsara", "the second one"), select the matching
+        product_id from that prior result and call this tool immediately.
+        Do NOT call search_products again — the product_id is already in your context.
 
         QUANTITY RULES — validate BEFORE calling this tool:
           BRANDED items (is_loose=False): quantity MUST be a whole number (1, 2, 3...).
@@ -1259,7 +1430,12 @@ def _build_active_tools(
                     "Call search_products(query='<item name>') to get the correct product_id."
                 )
             return f"ERROR: {msg}"
-        return str(result)
+        return (
+            str(result) + "\n"
+            "Ask: 'Would you like to add anything else?'\n"
+            "Only ask about payment method when the owner says they are done "
+            "(e.g. 'done', 'that's all', 'proceed', 'checkout', 'finalize')."
+        )
 
     async def remove_item_from_draft(product_id: str) -> str:
         """
@@ -1338,6 +1514,14 @@ def _build_active_tools(
         MANDATORY before Stage 2 (payment mode): call this tool to get the accurate
         total_amount (with GST). NEVER quote a total from memory or conversation history
         — always call this tool so the owner sees the correct amount before paying.
+        After showing the total, ALWAYS ask:
+        'How would you like to pay — Cash, UPI, or credit (add to khata)?'
+        NEVER ask only 'cash or UPI' — credit/khata is ALWAYS the third option.
+
+        ⚠️ DO NOT call this tool on greetings ('hi', 'hello', 'hii', etc.) or messages
+        that do not explicitly mention billing or items. On a greeting with a stale draft
+        open, ask the owner whether to continue, finalize, or cancel — do NOT inspect
+        or act on the draft automatically.
         """
         resolved_id = _draft_id_cell[0]
         if not resolved_id:
@@ -1358,6 +1542,17 @@ def _build_active_tools(
         - customer_id: required — UUID from get_customer/add_customer
         Do NOT pass draft_bill_id — resolved automatically.
         Do NOT call confirm_payment() after this — credit bills are auto-confirmed.
+
+        CREDIT FLOW (owner says 'credit', 'khata', 'add to <name> khata'):
+          Step 1 — call get_customer(name_or_phone) using the name the owner gave.
+          Step 2 — if customer FOUND: show the owner: 'Found <Name> (<phone>). Is this the same customer?'
+                   WAIT for owner to confirm YES or NO before calling finalize_bill.
+                   If YES → use that customer_id.
+                   If NO → ask for the correct 10-digit phone, then add_customer(name, phone).
+          Step 3 — if customer NOT FOUND: ask for 10-digit phone → add_customer(name, phone).
+          Step 4 — call finalize_bill(payment_mode='CREDIT', is_credit=True, customer_id=<uuid>).
+        ⚠️ NEVER call add_credit_entry directly — finalize_bill creates the bill AND the khata entry.
+        ⚠️ NEVER skip finalize_bill — calling add_credit_entry leaves the draft OPEN with no bill.
         """
         # Always use the server-authoritative active draft — never trust LLM-passed IDs
         resolved_id = _draft_id_cell[0]
@@ -1426,6 +1621,121 @@ def _build_active_tools(
         """
         resolved_id = _draft_id_cell[0]
         if not resolved_id:
+            # ── Self-heal: PENDING_PAYMENT bill already exists from a previous turn ──
+            # The model called finalize_and_pay again (with paid_amount) instead of
+            # confirm_payment. Execute the confirm logic inline — do NOT ask the model
+            # to call confirm_payment, because it issues both tools in the same parallel
+            # batch and the confirm_payment return gets dropped.
+            if paid_amount is not None and _bill_id_cell[0] is not None:
+                pending_id = _bill_id_cell[0]
+                bill = await mcps.billing.get_bill_for_payment(pending_id)
+                if not bill:
+                    return "ERROR: Pending bill not found. Cannot confirm payment."
+                # Guard: if bill is already CONFIRMED, do not re-confirm
+                if bill.get("status") == "CONFIRMED":
+                    _bill_num_c = bill.get("bill_number", pending_id)
+                    return (
+                        f"⚠️ Bill {_bill_num_c} is already CONFIRMED — do NOT call finalize_and_pay or confirm_payment again.\n"
+                        f"  • To reverse this bill → call void_bill() immediately.\n"
+                        f"  • To start a new bill → call create_draft_bill()."
+                    )
+                bill_total = float(bill["total_amount"])
+                bill_num   = bill["bill_number"]
+                bill_mode  = bill["payment_mode"]
+                subtotal   = float(bill["subtotal"])
+                total_gst  = round(float(bill.get("total_cgst", 0)) + float(bill.get("total_sgst", 0)), 2)
+                # Resolve customer from name if provided
+                resolved_customer_id: str | None = bill.get("customer_id")
+                if customer_name and not resolved_customer_id:
+                    try:
+                        cust_result = await mcps.khata.get_customer(
+                            store_id=store_id, name_or_phone=customer_name.strip()
+                        )
+                        if cust_result.found and cust_result.customers:
+                            resolved_customer_id = cust_result.customers[0].customer_id
+                    except Exception:
+                        pass
+                diff = round(paid_amount - bill_total, 2)
+                redis = _get_redis()
+                if diff == 0:
+                    confirm_result = await mcps.billing.confirm_payment(bill_id=pending_id)
+                    if not confirm_result.success:
+                        return f"ERROR confirming bill: {confirm_result.message}"
+                    _last_confirmed_bill_cell[0] = pending_id
+                    _bill_id_cell[0] = None
+                    await mcps.payments.record_payment(
+                        store_id=store_id, bill_id=pending_id, bill_number=bill_num,
+                        customer_id=resolved_customer_id, paid_amount=paid_amount,
+                        payment_mode=bill_mode, payment_type="EXACT",
+                        payment_status="CONFIRMED", subtotal=subtotal,
+                        total_gst=total_gst, bill_amount=bill_total,
+                        change_amount=0.0, balance_due=0.0,
+                    )
+                    if resolved_customer_id:
+                        try:
+                            await mcps.billing.link_bill_customer(bill_id=pending_id, customer_id=resolved_customer_id)
+                        except Exception:
+                            pass
+                    if redis:
+                        await redis.clear_pending_payment(tuid)
+                    customer_note = f" | customer={customer_name}" if customer_name and resolved_customer_id else ""
+                    return (
+                        f"✅ Payment confirmed! Bill {bill_num} paid in full.\n"
+                        f"paid=₹{paid_amount:.2f} | total=₹{bill_total:.2f} | EXACT{customer_note}\n"
+                        f"⚠️ STOP. Do NOT call any other tool. Inform the owner and ask what's next."
+                    )
+                elif diff > 0:
+                    change_amount = diff
+                    if redis:
+                        await redis.set_pending_payment(tuid, {
+                            "bill_id": pending_id, "bill_number": bill_num,
+                            "bill_amount": bill_total, "paid_amount": paid_amount,
+                            "payment_mode": bill_mode, "payment_reference": bill.get("payment_reference"),
+                            "intent_type": "OVERPAYMENT", "delta_amount": change_amount,
+                            "store_id": store_id, "subtotal": subtotal, "total_gst": total_gst,
+                            "customer_id": resolved_customer_id,
+                        })
+                    return (
+                        f"₹{paid_amount:.2f} received for Bill {bill_num} (total ₹{bill_total:.2f}).\n"
+                        f"OVERPAYMENT — change = ₹{change_amount:.2f}\n"
+                        f"⚠️ STOP HERE. Ask the owner exactly this:\n"
+                        f"'₹{change_amount:.2f} extra received. Return change to customer as cash, "
+                        f"or add to their khata account?'\n"
+                        f"⚠️ Do NOT call any other tool until owner answers.\n"
+                        f"  • Return cash → call collect_balance_now().\n"
+                        f"  • Add to khata → get_customer(name) then add_payment_entry(customer_id).\n"
+                        f"⚠️ CRITICAL: For overpayment-to-khata use add_payment_ENTRY (NOT add_credit_entry)."
+                    )
+                else:
+                    balance_due = round(-diff, 2)
+                    if redis:
+                        await redis.set_pending_payment(tuid, {
+                            "bill_id": pending_id, "bill_number": bill_num,
+                            "bill_amount": bill_total, "paid_amount": paid_amount,
+                            "payment_mode": bill_mode, "payment_reference": bill.get("payment_reference"),
+                            "intent_type": "UNDERPAYMENT", "delta_amount": balance_due,
+                            "store_id": store_id, "subtotal": subtotal, "total_gst": total_gst,
+                            "customer_id": resolved_customer_id,
+                        })
+                    return (
+                        f"₹{paid_amount:.2f} received for Bill {bill_num} (total ₹{bill_total:.2f}).\n"
+                        f"UNDERPAYMENT — remaining balance = ₹{balance_due:.2f}\n"
+                        f"⚠️ STOP HERE. Ask the owner exactly this:\n"
+                        f"'₹{balance_due:.2f} is still due. Will the customer pay the balance now, "
+                        f"or should I add it to their khata?'\n"
+                        f"⚠️ Do NOT call any other tool until owner answers.\n"
+                        f"  • Collect now → call collect_balance_now().\n"
+                        f"  • Add to khata → get_customer(name) then add_credit_entry(customer_id)."
+                    )
+            # No draft and no paid_amount — check if owner is trying to change payment mode
+            # on an existing PENDING_PAYMENT bill (e.g. "change to upi", "use cash instead").
+            if _bill_id_cell[0] is not None:
+                return (
+                    f"ERROR: No active draft bill. There is a PENDING_PAYMENT bill waiting for payment.\n"
+                    f"If the owner wants to change the payment mode, call change_payment_mode(new_payment_mode=...).\n"
+                    f"If the owner states a paid amount, call confirm_payment(paid_amount=<amount>).\n"
+                    f"Do NOT create a new draft — the existing bill is still open."
+                )
             return "ERROR: No active draft bill found. Call create_draft_bill() first."
 
         # Step 1 — finalize (always)
@@ -1531,12 +1841,15 @@ def _build_active_tools(
             return (
                 f"bill_number={bill_num} | total=₹{bill_total:.2f} | paid=₹{paid_amount:.2f}\n"
                 f"✅ CONFIRMED. OVERPAYMENT — change = ₹{change_amount:.2f}\n"
-                f"⚠️ STOP HERE. Do NOT call get_customer, add_customer, or add_payment_entry this turn.\n"
+                f"⚠️ STOP HERE. Do NOT call any tool this turn.\n"
                 f"⚠️ Do NOT reuse any customer from conversation history — this is a new independent bill.\n"
                 f"Ask the owner: 'Change is ₹{change_amount:.2f}. Return as cash, or add to customer's khata?'\n"
-                f"ONLY in the NEXT turn (after owner answers + gives customer name):\n"
-                f"  call get_customer(name) → add_payment_entry(customer_id, amount={change_amount:.2f}, "
-                f"notes='Overpayment from bill {bill_num}')."
+                f"ONLY in the NEXT turn (after owner answers):\n"
+                f"  • If 'return cash' → do nothing. Inform the owner and stop.\n"
+                f"  • If 'add to khata' → get_customer(name) → add_payment_entry(customer_id) ← amount=None reads from Redis.\n"
+                f"⚠️ CRITICAL: For overpayment-to-khata use add_payment_ENTRY (NOT add_credit_entry).\n"
+                f"  add_payment_entry = shop owes customer (balance goes negative = shop favour).\n"
+                f"  add_credit_entry  = customer owes shop — WRONG for overpayment change."
             )
         else:  # diff < 0
             # UNDERPAYMENT — store balance in Redis, payment row inserted in resolution turn
@@ -1599,17 +1912,19 @@ def _build_active_tools(
         """
         Resolve a pending UNDERPAYMENT or OVERPAYMENT by treating the bill as fully settled.
 
-        USE WHEN the owner says any of:
-          - 'will collect now', 'collect now', 'paying now', 'pay balance now',
+        USE WHEN the owner says the customer will pay the remaining balance RIGHT NOW in cash:
+          OVERPAYMENT: 'return change', 'give change', 'return the change', 'return cash'
+          UNDERPAYMENT: 'will collect now', 'collect now', 'paying now', 'pay balance now',
             'customer is paying', 'got it', 'collected', 'received full amount'
-          After confirm_payment() detected UNDERPAYMENT and the customer will pay the balance immediately.
-          After confirm_payment() detected OVERPAYMENT and the owner will return change as cash (no khata).
 
-        WHAT THIS DOES:
-          - UNDERPAYMENT: records the FULL bill amount as EXACT payment (paid_amount = bill_total),
-            confirms the bill as CONFIRMED, clears Redis. No khata entry.
-          - OVERPAYMENT:  records the FULL paid_amount as EXACT payment (change returned as cash),
-            confirms the bill as CONFIRMED, clears Redis. No khata entry.
+        ⚠️ DO NOT call this tool when owner says 'add to khata', 'put in khata', 'save to khata',
+           or any variation of adding the balance to khata / credit.
+           For 'add to khata' on an UNDERPAYMENT: use get_customer(name) → add_credit_entry(customer_id).
+           For 'add to khata' on an OVERPAYMENT:  use get_customer(name) → add_payment_entry(customer_id).
+
+        WHAT THIS DOES (NO khata entry is created — physical cash exchange only):
+          - UNDERPAYMENT: records the FULL bill amount as EXACT payment, confirms bill as CONFIRMED.
+          - OVERPAYMENT:  records the FULL paid_amount as EXACT payment (change returned as cash).
 
         Do NOT pass any arguments — all values read from Redis intent.
         Do NOT call confirm_payment() before or after this.
@@ -1625,6 +1940,30 @@ def _build_active_tools(
         intent_type = intent.get("intent_type")
         if intent_type not in ("UNDERPAYMENT", "OVERPAYMENT"):
             return f"ERROR: Pending intent is '{intent_type}', not an over/underpayment. Cannot use collect_balance_now()."
+
+        # ── Hard guard: if the owner said "add to khata" this tool is WRONG ──────
+        # Check the resolution_hint stored in Redis (set by finalize_and_pay /
+        # confirm_payment when the model tells us the owner's choice).
+        # Fallback: if resolution_hint is "khata", refuse and redirect.
+        if intent.get("resolution_hint") == "khata":
+            _delta = intent.get("delta_amount", 0)
+            _bill_num = intent.get("bill_number", "")
+            if intent_type == "UNDERPAYMENT":
+                return (
+                    f"⚠️ WRONG TOOL — the owner chose 'add to khata', not 'collect now'.\n"
+                    f"Bill {_bill_num} has an UNDERPAYMENT of ₹{_delta:.2f} to add to khata.\n"
+                    f"Do NOT call collect_balance_now(). Instead:\n"
+                    f"  1. get_customer(name) to resolve the customer_id.\n"
+                    f"  2. add_credit_entry(customer_id) — amount=None reads ₹{_delta:.2f} from Redis automatically."
+                )
+            else:  # OVERPAYMENT
+                return (
+                    f"⚠️ WRONG TOOL — the owner chose 'add to khata', not 'return change'.\n"
+                    f"Bill {_bill_num} has an OVERPAYMENT of ₹{_delta:.2f} to add to khata.\n"
+                    f"Do NOT call collect_balance_now(). Instead:\n"
+                    f"  1. get_customer(name) to resolve the customer_id.\n"
+                    f"  2. add_payment_entry(customer_id) — amount=None reads ₹{_delta:.2f} from Redis automatically."
+                )
 
         bill_id    = intent["bill_id"]
         bill_num   = intent["bill_number"]
@@ -1732,6 +2071,35 @@ def _build_active_tools(
         Do NOT pass bill_id — resolved automatically.
         Do NOT call any other tool in the same turn after this.
         """
+        # ── Guard: if a Redis OVERPAYMENT/UNDERPAYMENT intent already exists, the model
+        # is calling confirm_payment again instead of the resolution tool.
+        # Do NOT re-run classification — redirect immediately.
+        _redis_guard = _get_redis()
+        _existing_intent = None
+        if _redis_guard:
+            _existing_intent = await _redis_guard.get_pending_payment(tuid)
+        if _existing_intent and _existing_intent.get("intent_type") in ("OVERPAYMENT", "UNDERPAYMENT"):
+            _itype     = _existing_intent["intent_type"]
+            _bill_num  = _existing_intent.get("bill_number", "")
+            _delta     = float(_existing_intent.get("delta_amount", 0))
+            if _itype == "OVERPAYMENT":
+                return (
+                    f"⚠️ STOP — bill {_bill_num} is already confirmed as OVERPAYMENT.\n"
+                    f"Change = ₹{_delta:.2f}. Do NOT call confirm_payment again.\n"
+                    f"  • Return cash → call collect_balance_now() immediately.\n"
+                    f"  • Add to khata → get_customer(name) → add_payment_entry(customer_id).\n"
+                    f"⚠️ CRITICAL: For overpayment-to-khata use add_payment_ENTRY (NOT add_credit_entry).\n"
+                    f"  add_payment_entry = shop owes customer (balance goes negative = shop favour).\n"
+                    f"  add_credit_entry  = customer owes shop — WRONG for overpayment change."
+                )
+            else:
+                return (
+                    f"⚠️ STOP — bill {_bill_num} is already confirmed as UNDERPAYMENT.\n"
+                    f"Balance due = ₹{_delta:.2f}. Do NOT call confirm_payment again.\n"
+                    f"  • Collect now → call collect_balance_now() immediately.\n"
+                    f"  • Add to khata → get_customer(name) → add_credit_entry(customer_id)."
+                )
+
         resolved_bill_id = _bill_id_cell[0]
         if not resolved_bill_id:
             return "ERROR: No PENDING_PAYMENT bill found. Nothing to confirm."
@@ -1740,6 +2108,20 @@ def _build_active_tools(
         bill = await mcps.billing.get_bill_for_payment(resolved_bill_id)
         if not bill:
             return "ERROR: Bill not found. Cannot confirm payment."
+
+        # ── Guard: bill is already CONFIRMED — do not re-run confirm logic ──
+        # This can happen when the owner says something like "cancel this bill"
+        # after an underpayment was already fully resolved (Redis key cleared).
+        # The model re-calls confirm_payment, which must be blocked here so it
+        # doesn't create a duplicate payment row + khata entry.
+        if bill.get("status") == "CONFIRMED":
+            bill_num_confirmed = bill.get("bill_number", resolved_bill_id)
+            return (
+                f"⚠️ Bill {bill_num_confirmed} is already CONFIRMED — do NOT call confirm_payment again.\n"
+                f"  • To reverse this bill → call void_bill() immediately.\n"
+                f"  • To view the bill → call get_bill(bill_id='{resolved_bill_id}').\n"
+                f"  • To start a new bill → call create_draft_bill()."
+            )
 
         bill_total  = float(bill["total_amount"])
         bill_num    = bill["bill_number"]
@@ -1876,27 +2258,137 @@ def _build_active_tools(
                 f"  • Add to khata → get_customer(name) then add_credit_entry(customer_id)."
             )
 
-    async def change_payment_mode(new_payment_mode: str) -> str:
+    async def change_payment_mode(new_payment_mode: str, customer_id: str | None = None) -> str:
         """
-        Change the payment mode of the current PENDING_PAYMENT bill.
-        Use when owner says 'change to cash', 'change to upi', 'use cash instead', etc.
-        - new_payment_mode: CASH or UPI (CREDIT not supported here — use cancel_bill + new bill for credit).
-        Cancels the current bill, rebuilds it with all the same items, and re-finalizes
-        with the new payment mode. Returns the new bill number and total.
+        Change the payment mode of the current PENDING_PAYMENT bill BEFORE any payment has been taken.
+        Use ONLY when owner says 'change to cash', 'change to upi', 'change to credit/khata'
+        and NO payment has been received yet (i.e. confirm_payment has NOT been called yet).
+
+        ⚠️ DO NOT call this tool if confirm_payment() already ran and detected UNDERPAYMENT.
+           In that case 'add to khata' means record the remaining balance as a khata entry —
+           use get_customer(name) → add_credit_entry(customer_id) instead.
+           This tool would wrongly cancel and re-create the entire bill as CREDIT.
+
+        - new_payment_mode: CASH, UPI, or CREDIT.
+        - customer_id: REQUIRED when new_payment_mode is CREDIT — UUID from get_customer/add_customer.
+          For CASH/UPI, leave customer_id as None.
+        Cancels the current bill, rebuilds all items, and re-finalizes with the new payment mode.
         Do NOT pass bill_id — resolved automatically.
+
+        CREDIT FLOW (owner says 'change to credit', 'credit instead' — NO payment received yet):
+          Step 1 — call get_customer(name) using the name the owner gave.
+          Step 2 — if FOUND: use that customer_id.
+                   If NOT FOUND: ask for 10-digit phone → add_customer(name, phone).
+          Step 3 — call change_payment_mode(new_payment_mode='CREDIT', customer_id=<uuid>).
+        ⚠️ For CREDIT: do NOT call add_credit_entry separately — change_payment_mode handles everything.
         """
         resolved_bill_id = _bill_id_cell[0]
         if not resolved_bill_id:
             return "ERROR: No PENDING_PAYMENT bill found to change payment mode for."
+
+        mode_upper = new_payment_mode.strip().upper()
+
+        # ── Hard guard: block CREDIT path if an UNDERPAYMENT resolution is pending ──
+        # "add to <name> khata" after an underpayment means record the remaining balance
+        # as a khata entry — NOT convert the whole bill to CREDIT.
+        if mode_upper == "CREDIT":
+            redis = _get_redis()
+            if redis:
+                _existing = await redis.get_pending_payment(tuid)
+                if _existing and _existing.get("intent_type") == "UNDERPAYMENT":
+                    _delta = _existing.get("delta_amount", 0)
+                    _bill_num = _existing.get("bill_number", "")
+                    return (
+                        f"⚠️ WRONG TOOL — bill {_bill_num} has a confirmed UNDERPAYMENT of ₹{_delta:.2f}.\n"
+                        f"The owner wants to add the remaining ₹{_delta:.2f} to khata — NOT convert the bill to CREDIT.\n"
+                        f"Do NOT call change_payment_mode. Instead:\n"
+                        f"  1. get_customer(name) to resolve the customer_id.\n"
+                        f"  2. add_credit_entry(customer_id) — amount=None reads ₹{_delta:.2f} from Redis automatically."
+                    )
+
+        # ── CREDIT path: cancel + rebuild + re-finalize as credit ─────────────
+        # BillingMCP.change_payment_mode does not support CREDIT (no customer/khata linkage).
+        # Mirrors what BillingMCP.change_payment_mode does for CASH/UPI but finalizes with
+        # is_credit=True and customer_id so the khata entry and payment row are created.
+        if mode_upper == "CREDIT":
+            from src.utils.guardrails import clean_uuid
+            if not customer_id or not clean_uuid(customer_id):
+                return (
+                    "To change to CREDIT (khata), a customer_id is required.\n"
+                    "Step 1: call get_customer(name_or_phone) to find the customer.\n"
+                    "Step 2: if not found, call add_customer(name, phone).\n"
+                    "Step 3: call change_payment_mode(new_payment_mode='CREDIT', customer_id=<uuid>)."
+                )
+            # 1. Load bill items before cancelling (BillingMCP internal helper not accessible here —
+            #    query bill_items directly).
+            items_resp = (
+                mcps.billing.db.schema("billing")
+                .table("bill_items")
+                .select("product_id, quantity")
+                .eq("bill_id", resolved_bill_id)
+                .execute()
+            )
+            bill_items = items_resp.data or []
+            if not bill_items:
+                return "ERROR: No items found on the existing bill. Cannot change payment mode."
+
+            # 2. Cancel the PENDING_PAYMENT bill (restores stock, records CANCELLED audit row)
+            cancel_result = await mcps.billing.cancel_bill(bill_id=resolved_bill_id)
+            if not cancel_result.success:
+                return f"ERROR: Could not cancel the existing bill: {cancel_result.message}"
+            _bill_id_cell[0] = None
+
+            # 3. Create a new draft
+            new_draft = await mcps.billing.create_draft_bill(
+                store_id=store_id, telegram_user_id=tuid
+            )
+            new_draft_id = new_draft.draft_bill_id
+            _draft_id_cell[0] = new_draft_id
+
+            # 4. Re-add all items to the new draft
+            for item in bill_items:
+                if not item.get("product_id"):
+                    continue
+                try:
+                    await mcps.billing.add_item_to_draft(
+                        draft_bill_id=new_draft_id,
+                        product_id=item["product_id"],
+                        quantity=float(item["quantity"]),
+                    )
+                except Exception:
+                    pass  # skip deleted products
+
+            # 5. Finalize as CREDIT with customer linkage
+            finalized = await mcps.billing.finalize_bill(
+                draft_bill_id=new_draft_id,
+                payment_mode="CREDIT",
+                telegram_user_id=tuid,
+                is_credit=True,
+                customer_id=customer_id,
+            )
+            _draft_id_cell[0] = None
+            _bill_id_cell[0] = finalized.bill_id
+            _last_confirmed_bill_cell[0] = finalized.bill_id
+            return (
+                f"✅ Payment mode changed to CREDIT.\n"
+                f"bill_number={finalized.bill_number}\n"
+                f"status=CONFIRMED\n"
+                f"total=₹{finalized.total_amount:.2f} | payment_mode=CREDIT\n"
+                f"{finalized.message}\n"
+                f"✅ Bill CONFIRMED. Khata entry recorded. Do NOT call confirm_payment(). "
+                f"Inform the owner and ask if they need anything else."
+            )
+
+        # ── CASH/UPI path: delegate to BillingMCP ─────────────────────────────
         result = await mcps.billing.change_payment_mode(
             bill_id=resolved_bill_id,
-            new_payment_mode=new_payment_mode,
+            new_payment_mode=mode_upper,
             telegram_user_id=tuid,
         )
         # Update cell to the new bill_id
         _bill_id_cell[0] = result.bill_id
         return (
-            f"✅ Payment mode changed to {new_payment_mode.upper()}.\n"
+            f"✅ Payment mode changed to {mode_upper}.\n"
             f"bill_number={result.bill_number}\n"
             f"status=PENDING_PAYMENT\n"
             f"total=₹{result.total_amount:.2f} | payment_mode={result.payment_mode}\n"
@@ -1999,7 +2491,7 @@ def _build_active_tools(
         result = await mcps.khata.add_customer(
             store_id=store_id, name=name, phone=phone
         )
-        return f"customer_id={result.customer_id}\n{result.message}"
+        return f"[internal customer_id={result.customer_id} — use for finalize_bill/add_credit_entry, do NOT show to owner]\n{result.message}"
 
     async def get_customer(name_or_phone: str) -> str:
         """Look up a customer by name or phone."""
@@ -2008,16 +2500,27 @@ def _build_active_tools(
         )
         if not result.found:
             return f"No customer found matching '{name_or_phone}'."
-        lines = []
-        for c in result.customers:
-            lines.append(
-                f"customer_id={c.customer_id} | {c.name} ({c.phone}) | {_balance_summary(c.current_balance, c.name)}"
+        if len(result.customers) == 1:
+            c = result.customers[0]
+            bal, owes = _balance_cols(c.current_balance)
+            return (
+                f"customer_id={c.customer_id} | {c.name} ({c.phone}) | "
+                f"balance={bal} | owes={owes}"
             )
+        lines = [
+            f"Multiple customers found for '{name_or_phone}':",
+            "| Name | Phone | Balance | Owes | customer_id |",
+            "|------|-------|---------|------|-------------|",
+        ]
+        for c in result.customers:
+            bal, owes = _balance_cols(c.current_balance)
+            lines.append(f"| {c.name} | {c.phone} | {bal} | {owes} | {c.customer_id} |")
         return "\n".join(lines)
 
     async def add_credit_entry(customer_id: str, amount: float | None = None, notes: str | None = None) -> str:
         """
         Record that a customer owes the shop money (underpayment balance or standalone credit).
+        amount_delta = POSITIVE (customer owes shop more).
 
         USE FOR:
           - Underpayment resolution: after confirm_payment detected underpayment and owner chose 'add to khata'
@@ -2025,23 +2528,71 @@ def _build_active_tools(
           - Standalone credit advance: owner gives goods on credit outside a billing session
             → pass the explicit amount
 
-        DO NOT USE FOR overpayments — use add_payment_entry for those.
+        ⚠️ DO NOT USE FOR OVERPAYMENTS — that is add_payment_entry (opposite sign).
+          Overpayment = shop owes customer change → add_payment_entry (negative delta).
+          Underpayment = customer owes shop balance → add_credit_entry (positive delta).
         customer_id MUST be a valid UUID from get_customer/add_customer.
 
         UNDERPAYMENT FLOW (most common):
-          1. confirm_payment(paid_amount=X) detected underpayment → balance stored in Redis
+          1. confirm_payment(paid_amount=X) or finalize_and_pay detected underpayment → balance stored in Redis
           2. Owner said 'add to khata' + provided customer name
           3. get_customer(name) → got customer_id
           4. add_credit_entry(customer_id=<uuid>) ← amount=None reads from Redis
+
+        ⚠️ IMPORTANT — if there is an active draft bill (items were added this session):
+        DO NOT call this tool. Call finalize_bill(payment_mode='CREDIT', is_credit=True,
+        customer_id=<uuid>) instead — it creates the bill record AND the khata entry together.
+        (This tool will self-heal internally when a draft is open, but always use finalize_bill.)
         """
         from src.utils.guardrails import clean_uuid
         if not clean_uuid(customer_id):
             return "ERROR: customer_id must be a valid UUID. Call get_customer() or add_customer() first."
 
+        # ── Self-heal: open draft bill exists but model called add_credit_entry directly ──
+        # The correct path is finalize_bill(payment_mode='CREDIT', is_credit=True, customer_id=...)
+        # which creates the bill, khata entry, and payment row atomically.
+        # If the model skipped finalize_bill (e.g. routing landed in BILLING_CONFIRM while a draft
+        # was still open), do it now so no bill or payment row is lost.
+        if _draft_id_cell[0] is not None:
+            draft_id = _draft_id_cell[0]
+            finalized = await mcps.billing.finalize_bill(
+                draft_bill_id=draft_id,
+                payment_mode="CREDIT",
+                telegram_user_id=tuid,
+                is_credit=True,
+                customer_id=customer_id,
+            )
+            _draft_id_cell[0] = None
+            _bill_id_cell[0] = finalized.bill_id
+            _last_confirmed_bill_cell[0] = finalized.bill_id
+            return (
+                f"bill_number={finalized.bill_number}\n"
+                f"status=CONFIRMED\n"
+                f"total=₹{finalized.total_amount:.2f} | payment_mode=CREDIT\n"
+                f"{finalized.message}\n"
+                f"✅ Bill is CONFIRMED. The khata entry has been recorded. "
+                f"Inform the owner and ask if they need anything else."
+            )
+
         redis = _get_redis()
         intent = None
         if redis:
             intent = await redis.get_pending_payment(tuid)
+
+        # ── Hard guard: OVERPAYMENT intent in Redis means the caller picked the wrong tool.
+        # add_credit_entry = customer owes shop (+delta). For overpayment, the shop owes the
+        # customer — that is add_payment_entry (-delta). Redirect immediately so the correct
+        # payment row and khata entry are recorded.
+        if intent and intent.get("intent_type") == "OVERPAYMENT":
+            _delta = float(intent.get("delta_amount", 0))
+            _bill_num = intent.get("bill_number", "")
+            return (
+                f"⚠️ WRONG TOOL — bill {_bill_num} has an OVERPAYMENT of ₹{_delta:.2f}.\n"
+                f"add_credit_entry records 'customer owes shop' — that is WRONG for overpayment.\n"
+                f"The shop owes the customer ₹{_delta:.2f} change.\n"
+                f"Call add_payment_entry(customer_id='{customer_id}') instead "
+                f"(pass amount=None so the correct amount is read from Redis)."
+            )
 
         # Detect whether confirm_payment was bypassed:
         # If there is a PENDING_PAYMENT bill in _bill_id_cell but no Redis intent,
@@ -2054,21 +2605,32 @@ def _build_active_tools(
         )
 
         if bypassed_confirm:
-            # Self-heal: confirm the PENDING_PAYMENT bill before recording the khata entry
+            # Self-heal: confirm the PENDING_PAYMENT bill before recording the khata entry.
+            # Guard: skip this path if the pending bill is a CREDIT bill — those are already
+            # CONFIRMED inside finalize_bill and should never reach here. Firing the
+            # bypassed_confirm path on a CREDIT bill would create a spurious UNDERPAYMENT row
+            # using the LLM-hallucinated `amount` instead of the real bill total.
             pending_bill_id = _bill_id_cell[0]
             bill_snap = await mcps.billing.get_bill_for_payment(pending_bill_id)
-            if bill_snap and bill_snap.get("status") == "PENDING_PAYMENT":
+            _is_credit_bill = bill_snap and (
+                bill_snap.get("is_credit") or
+                (bill_snap.get("payment_mode") or "").upper() == "CREDIT"
+            )
+            if bill_snap and bill_snap.get("status") == "PENDING_PAYMENT" and not _is_credit_bill:
                 confirm_result = await mcps.billing.confirm_payment(bill_id=pending_bill_id)
                 if confirm_result.success:
                     _last_confirmed_bill_cell[0] = pending_bill_id
                     _bill_id_cell[0] = None
-                    # Synthesise a minimal intent so the payment row is recorded below
+                    # Synthesise a minimal intent so the payment row is recorded below.
+                    # Use the bill's own total_amount as authoritative — never trust the
+                    # LLM-passed `amount` for the bill total (it may be hallucinated).
+                    bill_total = float(bill_snap.get("total_amount", 0))
                     intent = {
                         "intent_type": "UNDERPAYMENT",
                         "bill_id": pending_bill_id,
                         "bill_number": bill_snap.get("bill_number"),
-                        "bill_amount": float(bill_snap.get("total_amount", 0)),
-                        "paid_amount": float(bill_snap.get("total_amount", 0)) - float(amount),
+                        "bill_amount": bill_total,
+                        "paid_amount": bill_total - float(amount),
                         "payment_mode": bill_snap.get("payment_mode", "CASH"),
                         "subtotal": float(bill_snap.get("subtotal", 0)),
                         "total_gst": round(
@@ -2182,10 +2744,33 @@ def _build_active_tools(
         if not clean_uuid(customer_id):
             return "ERROR: customer_id must be a valid UUID. Call get_customer() or add_customer() first."
 
+        # Guard: negative amount means the model passed paid_amount instead of the balance.
+        # Reject immediately — never pass negative values to the khata MCP.
+        if amount is not None and float(amount) <= 0:
+            return (
+                f"ERROR: amount must be a positive number, got {amount}.\n"
+                f"For underpayment-to-khata, pass amount=None — the balance is read from Redis automatically.\n"
+                f"For overpayment-to-khata, pass amount=None — the change is read from Redis automatically."
+            )
+
         redis = _get_redis()
         intent = None
         if redis:
             intent = await redis.get_pending_payment(tuid)
+
+        # ── Hard guard: UNDERPAYMENT intent in Redis means the caller picked the wrong tool.
+        # add_payment_entry = shop owes customer (-delta). For underpayment, the customer
+        # owes the shop the remaining balance — that is add_credit_entry (+delta).
+        if intent and intent.get("intent_type") == "UNDERPAYMENT":
+            _delta = float(intent.get("delta_amount", 0))
+            _bill_num = intent.get("bill_number", "")
+            return (
+                f"⚠️ WRONG TOOL — bill {_bill_num} has an UNDERPAYMENT of ₹{_delta:.2f}.\n"
+                f"add_payment_entry records 'shop owes customer' — that is WRONG for underpayment.\n"
+                f"The customer owes the shop ₹{_delta:.2f} balance.\n"
+                f"Call add_credit_entry(customer_id='{customer_id}') instead "
+                f"(pass amount=None so the correct balance is read from Redis)."
+            )
 
         is_overpayment = (
             intent is not None
@@ -2254,19 +2839,25 @@ def _build_active_tools(
             if redis:
                 await redis.clear_pending_payment(tuid)
         else:
-            # Standalone KHATA_SETTLE — no bill
-            await mcps.payments.record_payment(
-                store_id=store_id,
-                bill_id=None,
-                customer_id=customer_id,
-                khata_entry_id=khata_result.entry_id,
-                paid_amount=resolved_amount,
-                payment_mode="CASH",
-                payment_type="KHATA_SETTLE",
-                payment_status="CONFIRMED",
-                change_amount=0.0,
-                balance_due=0.0,
-            )
+            # Standalone KHATA_SETTLE — only record a payment row when there is genuinely
+            # no bill context. If _bill_id_cell or _last_confirmed_bill_cell has a value,
+            # this call is likely a billing-context misfire (model retried after a crash
+            # and lost the Redis intent). In that case skip the payment row to avoid
+            # a spurious KHATA_SETTLE entry duplicating a billing payment.
+            _has_bill_context = bool(_bill_id_cell[0] or _last_confirmed_bill_cell[0])
+            if not _has_bill_context:
+                await mcps.payments.record_payment(
+                    store_id=store_id,
+                    bill_id=None,
+                    customer_id=customer_id,
+                    khata_entry_id=khata_result.entry_id,
+                    paid_amount=resolved_amount,
+                    payment_mode="CASH",
+                    payment_type="KHATA_SETTLE",
+                    payment_status="CONFIRMED",
+                    change_amount=0.0,
+                    balance_due=0.0,
+                )
 
         if resolved_ref_bill_id:
             try:
@@ -2301,9 +2892,11 @@ def _build_active_tools(
           • MRP / selling price per unit
           • GST rate: 0 for loose items; 5 / 12 / 18 / 28 for branded — NEVER guess
           • Reorder level (minimum stock before alert)
+          • Initial stock quantity (how many units the shop has right now)
 
         NEVER call this tool with assumed or guessed values for any of the above.
-        After adding, ALWAYS call receive_stock() to add initial stock before adding to bill.
+        ⚠️ SAME TURN RULE: once you have ALL fields including initial stock quantity,
+        call add_product() AND receive_stock() in the SAME turn — do NOT split across turns.
         The product_id is saved server-side — receive_stock() resolves it automatically.
         """
         from src.mcp.catalogue.models import AddProductResult
@@ -2313,7 +2906,7 @@ def _build_active_tools(
             brand=brand, hsn_code=hsn_code, gst_rate=gst_rate, telegram_user_id=tuid,
         )
         _last_added_product_id_cell[0] = result.product_id
-        return result.message + f"\n[product_id={result.product_id}] — Ask owner for initial stock quantity, then call receive_stock(), then add_item_to_draft()."
+        return result.message + f"\n[internal product_id={result.product_id} — use for receive_stock + add_item_to_draft, do NOT show to owner]"
 
     async def receive_stock(product_id: str, quantity: float, notes: str | None = None) -> str:
         """
@@ -2348,6 +2941,7 @@ def _build_active_tools(
             get_bill,
             add_customer, get_customer, add_credit_entry, add_payment_entry,
             get_payment_history, list_bills_for_customer, get_bills_by_date, generate_invoice_pdf,
+            list_customers_with_balances,
         ]
 
     # ── BILLING (default) — draft-building tools ──────────────────────────────
@@ -2358,6 +2952,7 @@ def _build_active_tools(
         cancel_draft_bill, change_payment_mode,
         add_customer, get_customer, add_credit_entry, add_payment_entry,
         add_product, receive_stock,
+        list_customers_with_balances,
     ]
 
 
@@ -2384,13 +2979,26 @@ def _get_redis():
 def _balance_summary(balance: float, name: str) -> str:
     """
     Return a single unambiguous sentence about a customer's balance.
-    Used by tool closures so the LLM never sees raw floats to misinterpret.
+    Used for single-customer prose contexts (payment history, settle khata, etc.).
     """
     if balance > 0:
         return f"{name} owes the shop ₹{balance:.2f}"
     if balance < 0:
         return f"Shop owes {name} ₹{abs(balance):.2f}"
     return f"{name}'s account is settled (₹0)"
+
+
+def _balance_cols(balance: float) -> tuple[str, str]:
+    """
+    Return (signed_balance, owes_label) for table rendering.
+    signed_balance: ₹+40.80 / ₹-40.80 / ₹0.00
+    owes_label:     'Customer owes' / 'Shop owes' / 'Settled'
+    """
+    if balance > 0:
+        return f"₹+{balance:.2f}", "Customer owes"
+    if balance < 0:
+        return f"₹-{abs(balance):.2f}", "Shop owes"
+    return "₹0.00", "Settled"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2462,6 +3070,49 @@ _BILLING_PAYMENT_WORDS = frozenset({
 
 _PAID_PATTERN = _re.compile(r"\bpaid\b.*?\d|[\w]+ paid\b", _re.IGNORECASE)
 
+# Matches "change/switch/modify/update ... cash/upi/mode" or "use/pay ... cash/upi ... instead"
+# Used by detect_intent to route payment-mode-change requests to BILLING_CONFIRM.
+_CHANGE_MODE_PATTERN = _re.compile(
+    r"\b(change|switch|update|modify)\b.{0,30}?(cash|upi|credit|payment mode|mode)\b"
+    r"|\b(use|pay with|pay by)\b.{0,20}?(cash|upi)\b.{0,10}?\binstead\b",
+    _re.IGNORECASE,
+)
+
+
+# Phrases the agent uses when asking for a customer name/phone to resolve an
+# overpayment or underpayment. If the previous assistant turn contained any of
+# these, the next reply (which may be just "kiran" or a phone number) must stay
+# in BILLING_CONFIRM so add_payment_entry / add_credit_entry with Redis + payment
+# recording are available — not the simpler BILLING-group variants.
+_BILLING_CONFIRM_FOLLOWUP_PHRASES = (
+    "customer's name",
+    "customer name",
+    "name or phone",
+    "phone number",
+    "10-digit",
+    "10‑digit",
+    "provide the customer",
+    "khata account",
+    "credit the extra",
+    "add the extra",
+    "add it to",
+    "extra received",
+    "change to customer",
+    "return this change",
+    "balance is still due",
+    "balance due",
+    "remaining balance",
+    # Payment-amount prompts from finalize_and_pay / change_payment_mode returns.
+    # When the agent has just asked "how much did the customer pay?" or stated the
+    # bill total, the owner's numeric reply (e.g. "1100", "paid 500") must stay in
+    # BILLING_CONFIRM so confirm_payment() is available — not fall back to BILLING
+    # where the model may re-call change_payment_mode or finalize_and_pay instead.
+    "how much did the customer pay",
+    "how much did they pay",
+    "bill total is",
+    "how much was paid",
+)
+
 
 # Phrases the agent uses when asking the owner to name a product for an inventory action.
 # If the previous assistant turn contained any of these, a bare product-name follow-up
@@ -2486,6 +3137,22 @@ _INVENTORY_FOLLOWUP_PHRASES = (
     "which item do you",
     "for which product",
     "for which item",
+)
+
+# If the previous assistant turn contained any of these, the next reply (typically a bare
+# date like "19th august" or "today") should stay in ANALYTICS so get_bills_by_date,
+# get_daily_summary, etc. are available — not fall back to BILLING.
+_ANALYTICS_FOLLOWUP_PHRASES = (
+    "which date",
+    "what date",
+    "date would you like",
+    "date range",
+    "for which date",
+    "report for",
+    "summary for",
+    "sales for",
+    "bills for which",
+    "specific date",
 )
 
 
@@ -2516,8 +3183,15 @@ def detect_intent(
     # whether the user's reply contains any INVENTORY keywords.
     if last_assistant_msg:
         last_lower = last_assistant_msg.lower()
+        # Only apply BILLING_CONFIRM followup routing when NO draft is active.
+        # With an active draft, "provide customer name" means the credit-bill flow
+        # (finalize_bill is in BILLING) — not post-payment over/underpayment resolution.
+        if not has_active_draft and any(p in last_lower for p in _BILLING_CONFIRM_FOLLOWUP_PHRASES):
+            return "BILLING_CONFIRM"
         if any(p in last_lower for p in _INVENTORY_FOLLOWUP_PHRASES):
             return "INVENTORY"
+        if any(p in last_lower for p in _ANALYTICS_FOLLOWUP_PHRASES):
+            return "ANALYTICS"
 
     # If a draft bill is active, payment-mode words mean "pay this bill" →
     # always BILLING (finalize_and_pay is there), not KHATA or BILLING_CONFIRM.
@@ -2547,6 +3221,11 @@ def detect_intent(
         "send bill", "pdf for", "pdf of", "invoice pdf",
         "send invoice", "generate invoice", "invoice for",
         "get bill", "fetch bill", "show bill details", "bill details",
+        # All-customer khata / balance listing
+        "all khata", "all balances", "all balance", "list all khata",
+        "all customers", "list customers", "show all customers",
+        "who owes", "list khata", "show khata", "khata list",
+        "outstanding balances", "all outstanding",
     })
     # Post-payment resolution: underpayment/overpayment answers that must ALWAYS
     # route to BILLING_CONFIRM so the Redis-aware tools with payment recording are used.
@@ -2567,26 +3246,48 @@ def detect_intent(
         "balance paid", "paid balance", "paid the rest", "paid remaining",
         "full amount paid", "paid full", "paid in full",
     })
-    # Lookup + resolution keywords are always allowed (draft or not)
+    # Lookup keywords are safe regardless of draft state (looking up a bill
+    # doesn't touch the current draft).
     if any(kw in msg for kw in _BILLING_CONFIRM_LOOKUP_KEYWORDS):
         return "BILLING_CONFIRM"
-    if any(kw in msg for kw in _BILLING_CONFIRM_RESOLUTION_KEYWORDS):
+    # Fuzzy match: "list/show/all + balance(s)/khata/khta/udhar" — catches typos
+    # like "list ass khta balances" or "all khata" that miss exact keyword matching.
+    if _re.search(r"\b(list|show|all|get)\b.{0,20}\b(balance|khata|khta|udhar)\b", msg):
         return "BILLING_CONFIRM"
-    # "khata" with any word(s) before it — catches "<name> khata", "to <name> khata",
-    # "add it to kalyan khata", "add to ramesh's khata", etc.
-    # Using regex so an intervening customer name doesn't break the match.
-    if _re.search(r"\bkhata\b", msg):
+    if _re.search(r"\b(balance|khata|khta|udhar)\b.{0,20}\b(list|all|show|everyone|customers?)\b", msg):
         return "BILLING_CONFIRM"
+
+    # Resolution keywords (pay now / collect now / add to khata / return change)
+    # are ONLY valid when no draft is active.
+    # With an active draft these words mean "finalise this draft bill" →
+    # must stay in BILLING so finalize_and_pay / finalize_bill are available.
+    if not has_active_draft:
+        if any(kw in msg for kw in _BILLING_CONFIRM_RESOLUTION_KEYWORDS):
+            return "BILLING_CONFIRM"
+        # "khata" with any word(s) before it — catches "<name> khata",
+        # "add to ramesh's khata", "add it to kalyan khata", etc.
+        # Guard: only when no draft active — mid-draft "add to khata" means
+        # "finalise as credit" → must stay in BILLING for finalize_bill.
+        if _re.search(r"\bkhata\b", msg):
+            return "BILLING_CONFIRM"
 
     # Payment/cancellation keywords — only when no active draft
     if not has_active_draft:
         for kw in INTENT_KEYWORDS["BILLING_CONFIRM"]:
             if kw in msg:
                 return "BILLING_CONFIRM"
+        # "change payment mode" phrases — only valid on a PENDING_PAYMENT bill (no draft active)
+        # change_payment_mode lives in the BILLING_CONFIRM tool group.
+        if _CHANGE_MODE_PATTERN.search(user_message):
+            return "BILLING_CONFIRM"
 
     for intent, keywords in INTENT_KEYWORDS.items():
         if intent == "BILLING_CONFIRM":
             continue  # already handled above
+        # When a draft is active, KHATA keywords mean "finalise as credit" →
+        # must stay in BILLING (finalize_bill is there), not route to KHATA.
+        if intent == "KHATA" and has_active_draft:
+            continue
         if any(kw in msg for kw in keywords):
             return intent
     return "BILLING"

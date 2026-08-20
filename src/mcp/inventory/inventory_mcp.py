@@ -188,6 +188,20 @@ class InventoryMCP:
         )
         prod = _one(prod_resp) or {}
 
+        # Guard: if product not found in catalogue (e.g. hallucinated UUID),
+        # return a clear error result rather than crashing with KeyError.
+        if not prod.get("name"):
+            return StockResult(
+                product_id=product_id,
+                product_name="Unknown product",
+                brand=None,
+                quantity_in_stock=0.0,
+                unit="PIECE",
+                reorder_level=0.0,
+                is_below_reorder=True,
+                last_restocked_at=None,
+            )
+
         resp_row = _one(inv_resp)
         if not resp_row:
             return StockResult(

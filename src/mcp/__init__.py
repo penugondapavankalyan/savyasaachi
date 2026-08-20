@@ -60,10 +60,10 @@ class MCPInstances:
         # Payments last — depends on KhataMCP (for balance reads in history)
         self.payments = PaymentsMCP(khata_mcp=self.khata)
 
-        # Late-bind PaymentsMCP into BillingMCP now that both are constructed.
-        # BillingMCP was constructed before PaymentsMCP existed (MCPInstances order),
-        # so we inject it here rather than passing at BillingMCP.__init__ time.
+        # Late-bind PaymentsMCP into BillingMCP and DocumentsMCP now that both are
+        # constructed. Both were built before PaymentsMCP existed (MCPInstances order).
         self.billing.set_payments_mcp(self.payments)
+        self.documents._payments = self.payments
 
 
 # Module-level singleton — reused across warm Lambda invocations

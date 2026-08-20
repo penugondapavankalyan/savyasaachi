@@ -96,34 +96,30 @@ class Settings:
     # ---- LLM provider selector ----
     @property
     def LLM_PROVIDER(self) -> str:
-        """'groq' or 'ollama'"""
-        return _optional("LLM_PROVIDER", "groq")
+        """'ollama' (groq removed)"""
+        return _optional("LLM_PROVIDER", "ollama")
 
-    # ── Groq settings (used when LLM_PROVIDER=groq) ──────────────────────────
-
-    @property
-    def LLM_MODEL(self) -> str:
-        """Primary Groq model. Fallback chain tries this first."""
-        return _optional("LLM_MODEL", "qwen/qwen3.6-27b")
-
-    @property
-    def LLM_FALLBACK_MODELS(self) -> list[str]:
-        """
-        Comma-separated ordered fallback Groq model list.
-        Tried in order after LLM_MODEL fails.
-        """
-        raw = _optional(
-            "LLM_FALLBACK_MODELS",
-            "llama-3.3-70b-versatile,openai/gpt-oss-20b,openai/gpt-oss-120b",
-        )
-        return [m.strip() for m in raw.split(",") if m.strip()]
-
-    @property
-    def GROQ_API_KEY(self) -> str:
-        """Required when LLM_PROVIDER=groq."""
-        if self.LLM_PROVIDER == "groq":
-            return _require("GROQ_API_KEY")
-        return _optional("GROQ_API_KEY")
+    # ── Groq settings — commented out (not used) ─────────────────────────────
+    # @property
+    # def LLM_MODEL(self) -> str:
+    #     """Primary Groq model. Fallback chain tries this first."""
+    #     return _optional("LLM_MODEL", "qwen/qwen3.6-27b")
+    #
+    # @property
+    # def LLM_FALLBACK_MODELS(self) -> list[str]:
+    #     """Comma-separated ordered fallback Groq model list."""
+    #     raw = _optional(
+    #         "LLM_FALLBACK_MODELS",
+    #         "llama-3.3-70b-versatile,openai/gpt-oss-20b,openai/gpt-oss-120b",
+    #     )
+    #     return [m.strip() for m in raw.split(",") if m.strip()]
+    #
+    # @property
+    # def GROQ_API_KEY(self) -> str:
+    #     """Required when LLM_PROVIDER=groq."""
+    #     if self.LLM_PROVIDER == "groq":
+    #         return _require("GROQ_API_KEY")
+    #     return _optional("GROQ_API_KEY")
 
     # ── Ollama settings (used when LLM_PROVIDER=ollama) ──────────────────────
     # Ollama cloud API: https://ollama.com/v1/chat/completions (OpenAI-compatible)
@@ -157,6 +153,24 @@ class Settings:
             return _require("OLLAMA_API_KEY")
         return _optional("OLLAMA_API_KEY", "ollama")  # local doesn't need a real key
 
+
+    # ---- LLM inference settings ----
+    @property
+    def LLM_TEMPERATURE(self) -> float:
+        """
+        Sampling temperature for the LLM (0.0 = deterministic, 1.0 = creative).
+        Low values are recommended for a billing agent to ensure consistent tool calls.
+        Defaults to 0.1 if LLM_TEMPERATURE is not set or invalid.
+        """
+        raw = _optional("LLM_TEMPERATURE", "")
+        if raw:
+            try:
+                val = float(raw)
+                if 0.0 <= val <= 2.0:
+                    return val
+            except ValueError:
+                pass
+        return 0.1  # safe default for a structured billing agent
 
     # ---- Lambda / runtime ----
     @property

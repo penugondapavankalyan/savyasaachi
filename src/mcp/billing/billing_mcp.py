@@ -10,6 +10,7 @@ Calls internally: CatalogueMCP, InventoryMCP, KhataMCP, IdentityMCP, PaymentsMCP
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 from src.utils.ist import date_range_iso
@@ -30,6 +31,40 @@ def _one(resp):
     if not data:
         return None
     return data[0] if isinstance(data, list) else data
+
+
+def _rpc_execute(db, rpc_name: str, params: dict) -> dict:
+    """
+    Execute a JSONB-returning RPC, working around the postgrest==1.0.2 bug
+    where APIError is raised even on success because it cannot validate the
+    raw JSONB response wrapper.
+
+    postgrest==1.0.2 puts the actual payload in exc.details as a bytes/str
+    like: b'{"success": true, "message": "..."}' — we extract and parse it.
+    """
+    from postgrest.exceptions import APIError
+    try:
+        resp = db.rpc(rpc_name, params).execute()
+        data = resp.data
+        if isinstance(data, list):
+            return data[0] if data else {}
+        return data if isinstance(data, dict) else {}
+    except APIError as exc:
+        details = getattr(exc, "details", None) or ""
+        if isinstance(details, bytes):
+            details = details.decode("utf-8", errors="replace")
+        details = details.strip()
+        # postgrest wraps the bytes repr: b'{"key": "val"}' — strip the b'...' wrapper
+        if (details.startswith("b'") and details.endswith("'")) or \
+           (details.startswith('b"') and details.endswith('"')):
+            details = details[2:-1]
+        try:
+            result = json.loads(details)
+            if isinstance(result, dict):
+                return result
+        except (json.JSONDecodeError, ValueError):
+            pass
+        raise  # re-raise if we couldn't extract a usable dict
 
 from src.mcp.billing.models import (
     AddItemResult,
@@ -639,7 +674,7 @@ class BillingMCP:
         if is_credit and customer_id:
             # Credit bills are immediately CONFIRMED — the debt is recorded in khata.
             # No cash/UPI payment is expected, so confirm_payment() must NOT be called.
-            self.db.rpc("confirm_payment", {"p_bill_id": bill_id}).execute()
+            _rpc_execute(self.db, "confirm_payment", {"p_bill_id": bill_id})
 
             khata_entry = await self._khata.add_credit_entry(
                 store_id=store_id,
@@ -694,8 +729,7 @@ class BillingMCP:
         Called by tool_registry confirm_payment tool AFTER PaymentsMCP.record_payment().
         Does NOT insert a payments row — that is done by the tool_registry flow.
         """
-        resp = self.db.rpc("confirm_payment", {"p_bill_id": bill_id}).execute()
-        result = resp.data
+        result = _rpc_execute(self.db, "confirm_payment", {"p_bill_id": bill_id})
         return CancelResult(
             success=bool(result.get("success", False)),
             message=result.get("message", "Unknown error from confirm_payment RPC."),
@@ -777,8 +811,7 @@ class BillingMCP:
             raise ValueError("Cannot change payment mode — bill has no items.")
 
         # 2. Cancel the existing bill (restores stock)
-        cancel_resp = self.db.rpc("cancel_bill", {"p_bill_id": bill_id}).execute()
-        cancel_result = cancel_resp.data
+        cancel_result = _rpc_execute(self.db, "cancel_bill", {"p_bill_id": bill_id})
         if not cancel_result.get("success"):
             raise RuntimeError(
                 f"Failed to cancel bill during payment mode change: "
@@ -797,7 +830,6 @@ class BillingMCP:
                 continue  # skip if product was deleted from catalogue
             await self.add_item_to_draft(
                 draft_bill_id=new_draft_id,
-                store_id=store_id,
                 product_id=item.product_id,
                 quantity=item.quantity,
             )
@@ -809,6 +841,29 @@ class BillingMCP:
             telegram_user_id=telegram_user_id,
         )
 
+    async def _get_reverse_khata_entry_id(self, bill_id: str) -> Optional[str]:
+        """
+        After cancel_bill or void_bill RPC runs on a CREDIT bill, the RPC inserts
+        a reverse khata entry (PAYMENT type, negative delta). Query for the most
+        recently created khata entry that references this bill_id so the payment
+        audit row can be linked via khata_entry_id.
+        Returns None if no such entry exists (non-credit bills).
+        """
+        try:
+            resp = (
+                self.db.schema("khata")
+                .table("khata_entries")
+                .select("id")
+                .eq("reference_bill_id", bill_id)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            rows = resp.data or []
+            return rows[0]["id"] if rows else None
+        except Exception:
+            return None
+
     async def cancel_bill(self, bill_id: str) -> CancelResult:
         """
         Cancel a PENDING_PAYMENT bill before payment is confirmed.
@@ -818,12 +873,15 @@ class BillingMCP:
         # Get bill details before cancelling (for payment row snapshot)
         bill = await self.get_bill_for_payment(bill_id)
 
-        resp = self.db.rpc("cancel_bill", {"p_bill_id": bill_id}).execute()
-        result = resp.data
+        result = _rpc_execute(self.db, "cancel_bill", {"p_bill_id": bill_id})
         success = bool(result.get("success", False))
 
         # Insert CANCELLED payment row for audit trail
         if success and bill and self._payments:
+            # For credit bills the RPC creates a reverse khata entry — link it.
+            khata_entry_id: Optional[str] = None
+            if bill.get("is_credit"):
+                khata_entry_id = await self._get_reverse_khata_entry_id(bill_id)
             await self._payments.record_payment(
                 store_id=bill["store_id"],
                 bill_id=bill_id,
@@ -833,6 +891,7 @@ class BillingMCP:
                 payment_mode=bill["payment_mode"],
                 payment_type="EXACT",
                 payment_status="CANCELLED",
+                khata_entry_id=khata_entry_id,
                 subtotal=float(bill["subtotal"]) if bill.get("subtotal") else None,
                 total_gst=round(
                     float(bill.get("total_cgst", 0)) + float(bill.get("total_sgst", 0)), 2
@@ -853,35 +912,85 @@ class BillingMCP:
         Restores stock and reverses khata credit entry.
         Also inserts a REFUNDED payment row for audit purposes.
 
-        Refund amount = paid_amount - change_amount from the original payment row.
-        This ensures only the cash actually received (minus any change already returned)
-        is recorded as refunded — not the full bill amount.
+        Refund amount rules:
+          - EXACT / UNDERPAYMENT: paid_amount - change_amount (change already returned as cash)
+          - OVERPAYMENT-to-khata: full paid_amount (change went to khata, not returned as cash)
 
         Examples:
-          Underpayment ₹300 on ₹400 bill  → refund ₹300  (300 - 0)
-          Overpayment ₹400 on ₹350, ₹50 change returned → refund ₹350  (400 - 50)
-          Overpayment ₹500 on ₹400, ₹100 to khata → refund ₹500  (500 - 0)
+          Exact ₹400 on ₹400 bill          → refund ₹400
+          Underpayment ₹300 on ₹400 bill   → refund ₹300  (no cash change)
+          Overpayment ₹400, ₹50 cash back  → refund ₹350  (400 - 50)
+          Overpayment ₹500, ₹100 to khata  → refund ₹500  (full amount; khata also reversed)
         """
         # Get bill details before voiding (for payment row snapshot)
         bill = await self.get_bill_for_payment(bill_id)
 
-        resp = self.db.rpc("void_bill", {"p_bill_id": bill_id}).execute()
-        result = resp.data
+        result = _rpc_execute(self.db, "void_bill", {"p_bill_id": bill_id})
         success = bool(result.get("success", False))
 
         # Insert REFUNDED payment row for audit trail
         if success and bill and self._payments:
-            # Look up the original payment row to get what the customer actually paid
-            # and how much change was already returned to them.
-            original_payment = await self._payments.get_payment_by_bill(bill_id)
+            # Look up the original CONFIRMED payment row (the first one, earliest created_at,
+            # to skip any later REFUNDED/CANCELLED audit rows for the same bill).
+            original_payment = await self._payments.get_first_confirmed_payment_by_bill(bill_id)
             if original_payment:
-                # Refund = what customer handed over minus change already given back
-                refund_amount = round(
-                    original_payment.paid_amount - original_payment.change_amount, 2
-                )
+                if original_payment.payment_type == "OVERPAYMENT":
+                    # For overpayment-to-khata: change_amount = the surplus added to khata,
+                    # NOT physical cash returned. The customer handed over the full paid_amount
+                    # and got nothing back in cash — so the full paid_amount is the refund.
+                    refund_amount = round(original_payment.paid_amount, 2)
+                else:
+                    # Exact / underpayment: refund only what was physically received
+                    # (paid_amount minus any cash change already returned to customer).
+                    refund_amount = round(
+                        original_payment.paid_amount - original_payment.change_amount, 2
+                    )
             else:
                 # No payment row (e.g. CREDIT bill voided) — fall back to bill total
                 refund_amount = float(bill["total_amount"]) if bill.get("total_amount") else 0.0
+
+            # Determine the khata entry to link in the REFUNDED audit row and reverse
+            # any khata balance changes made during the original payment.
+            khata_entry_id: Optional[str] = None
+            if bill.get("is_credit"):
+                # CREDIT bill: the void_bill RPC auto-inserts a reverse khata entry — link it.
+                khata_entry_id = await self._get_reverse_khata_entry_id(bill_id)
+            elif original_payment and original_payment.customer_id:
+                if (
+                    original_payment.payment_type == "UNDERPAYMENT"
+                    and original_payment.balance_due > 0
+                ):
+                    # CASH/UPI underpayment: khata has a CREDIT entry (+balance_due) that the
+                    # RPC did not reverse. Insert a PAYMENT entry (-balance_due) to cancel it.
+                    try:
+                        reverse = await self._khata.add_payment_entry(
+                            store_id=bill["store_id"],
+                            customer_id=original_payment.customer_id,
+                            amount=original_payment.balance_due,
+                            reference_bill_id=bill_id,
+                            notes="Void reversal — underpayment khata entry cancelled",
+                        )
+                        khata_entry_id = reverse.entry_id
+                    except Exception:
+                        pass  # audit link missing is non-fatal; balance is already reversed
+                elif (
+                    original_payment.payment_type == "OVERPAYMENT"
+                    and original_payment.change_amount > 0
+                ):
+                    # CASH/UPI overpayment-to-khata: khata has a PAYMENT entry (-change_amount,
+                    # i.e. shop owes customer) that the RPC did not reverse.
+                    # Insert a CREDIT entry (+change_amount) to cancel it.
+                    try:
+                        reverse = await self._khata.add_credit_entry(
+                            store_id=bill["store_id"],
+                            customer_id=original_payment.customer_id,
+                            amount=original_payment.change_amount,
+                            reference_bill_id=bill_id,
+                            notes="Void reversal — overpayment khata credit cancelled",
+                        )
+                        khata_entry_id = reverse.entry_id
+                    except Exception:
+                        pass  # audit link missing is non-fatal; balance is already reversed
 
             await self._payments.record_payment(
                 store_id=bill["store_id"],
@@ -892,6 +1001,7 @@ class BillingMCP:
                 payment_mode=bill["payment_mode"],
                 payment_type="EXACT",
                 payment_status="REFUNDED",
+                khata_entry_id=khata_entry_id,
                 subtotal=float(bill["subtotal"]) if bill.get("subtotal") else None,
                 total_gst=round(
                     float(bill.get("total_cgst", 0)) + float(bill.get("total_sgst", 0)), 2
@@ -967,6 +1077,7 @@ class BillingMCP:
             payment_mode=bill["payment_mode"],
             payment_reference=bill.get("payment_reference"),
             is_credit=bill["is_credit"],
+            status=bill.get("status", "UNKNOWN"),
             created_at=bill["created_at"],
         )
 

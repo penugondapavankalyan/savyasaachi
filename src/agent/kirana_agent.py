@@ -1,33 +1,15 @@
 """
-KiranaAgent — PydanticAI agent wrapper with model fallback cascade.
+KiranaAgent — PydanticAI agent wrapper.
 
-LLM_PROVIDER=groq  → Groq API with fallback chain
-LLM_PROVIDER=ollama → Ollama OpenAI-compatible API (cloud or local)
-
-Groq fallback chain (tried in order on recoverable errors):
-  1. qwen/qwen3.6-27b          — primary (8K TPM)
-  2. llama-3.3-70b-versatile   — best quality (12K TPM)
-  3. openai/gpt-oss-20b        — mid fallback (8K TPM)
-  4. openai/gpt-oss-120b       — last resort (8K TPM)
-
-Ollama: single model, no fallback chain (cloud or local).
+LLM_PROVIDER=ollama → Ollama OpenAI-compatible API (cloud or local).
   Cloud: OLLAMA_BASE_URL=https://ollama.com/v1  + OLLAMA_API_KEY
   Local: OLLAMA_BASE_URL=http://localhost:11434/v1  (no key needed)
-
-Recoverable errors that trigger fallback (Groq only):
-  - 429 Rate limit exceeded
-  - 503 Service unavailable
-  - 400 tool calling not supported
-  - UnexpectedModelBehavior (token limit hit)
-
-Non-recoverable errors (no fallback, raise immediately):
-  - 401 Invalid API key
-  - UserError (bad prompt structure)
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -35,9 +17,8 @@ from openai import AsyncOpenAI
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 from pydantic_ai.messages import ModelResponse, ToolCallPart, ToolReturnPart
-from pydantic_ai.models.groq import GroqModel
+# from pydantic_ai.models.groq import GroqModel  # unused — Groq removed
 from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.groq import GroqProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
 
@@ -78,6 +59,50 @@ def _is_recoverable(exc: Exception) -> bool:
     return False
 
 
+# ── Resolution hint: stamp Redis with owner's choice ("khata" vs "collect") ──
+# Must be async — called from KiranaAgent._execute() before tools are built.
+# Pattern-matches the raw user message against "add to khata" variants so that
+# collect_balance_now() can self-reject when the owner explicitly chose khata.
+_KHATA_HINT_RE = re.compile(
+    r"\b(add|put|save|store|record|keep)\b.{0,25}\b(khata|udhar)\b"
+    r"|\b(khata|udhar)\b.{0,10}\b(add|put|save|store|record)\b",
+    re.IGNORECASE,
+)
+_COLLECT_HINT_RE = re.compile(
+    r"\b(collect|paying|pay|got it|received|collected|will pay|paying now|collect now|balance paid|paid now)\b",
+    re.IGNORECASE,
+)
+
+
+async def _stamp_resolution_hint(tuid: int, user_message: str) -> None:
+    """
+    If a pending UNDERPAYMENT/OVERPAYMENT Redis key exists and the owner's
+    message clearly states their resolution choice, stamp `resolution_hint`
+    into the Redis payload so collect_balance_now() can validate intent.
+    Silently no-ops on any error.
+    """
+    try:
+        from src.agent.tool_registry import _get_redis  # avoid circular at module level
+        redis = _get_redis()
+        if not redis:
+            return
+        intent = await redis.get_pending_payment(tuid)
+        if not intent or intent.get("intent_type") not in ("UNDERPAYMENT", "OVERPAYMENT"):
+            return
+        # Don't overwrite an already-set hint
+        if intent.get("resolution_hint"):
+            return
+        msg = user_message.lower()
+        if _KHATA_HINT_RE.search(msg):
+            intent["resolution_hint"] = "khata"
+            await redis.set_pending_payment(tuid, intent)
+        elif _COLLECT_HINT_RE.search(msg):
+            intent["resolution_hint"] = "collect"
+            await redis.set_pending_payment(tuid, intent)
+    except Exception:
+        pass  # Never interrupt the main flow
+
+
 class KiranaAgent:
     """
     Wraps PydanticAI Agent with a model fallback cascade.
@@ -90,33 +115,21 @@ class KiranaAgent:
     def __init__(self) -> None:
         self.config = AgentConfig(
             llm_provider=settings.LLM_PROVIDER,
-            llm_model=settings.LLM_MODEL if settings.LLM_PROVIDER == "groq" else settings.OLLAMA_MODEL,
-            groq_api_key=settings.GROQ_API_KEY if settings.LLM_PROVIDER == "groq" else None,
+            llm_model=settings.OLLAMA_MODEL,
             ollama_base_url=settings.OLLAMA_BASE_URL,
             max_history_messages=settings.MAX_HISTORY_MESSAGES,
             draft_bill_ttl_hours=settings.DRAFT_BILL_TTL_HOURS,
         )
         self.mcps: MCPInstances = get_mcp_instances()
 
-        if settings.LLM_PROVIDER == "groq":
-            all_model_names = [settings.LLM_MODEL] + settings.LLM_FALLBACK_MODELS
-            seen: set[str] = set()
-            unique: list[str] = []
-            for m in all_model_names:
-                if m not in seen:
-                    seen.add(m)
-                    unique.append(m)
-            self._model_chain: list[Any] = [self._build_groq_model(m) for m in unique]
-            self._model_names: list[str] = unique
-        else:
-            self._model_chain = [self._build_ollama_model()]
-            self._model_names = [settings.OLLAMA_MODEL]
+        self._model_chain: list[Any] = [self._build_ollama_model()]
+        self._model_names: list[str] = [settings.OLLAMA_MODEL]
 
-    def _build_groq_model(self, model_name: str) -> GroqModel:
-        return GroqModel(
-            model_name=model_name,
-            provider=GroqProvider(api_key=self.config.groq_api_key or ""),
-        )
+    # def _build_groq_model(self, model_name: str) -> GroqModel:  # unused — Groq removed
+    #     return GroqModel(
+    #         model_name=model_name,
+    #         api_key=self.config.groq_api_key or "",
+    #     )
 
     def _build_ollama_model(self) -> OpenAIChatModel:
         """
@@ -159,6 +172,13 @@ class KiranaAgent:
             None,
         )
         intent = detect_intent(user_message, has_active_draft=has_active_draft, last_assistant_msg=last_assistant_msg)
+
+        # ── Write resolution_hint to Redis when owner explicitly chooses "add to khata"
+        # or "collect now" on a pending UNDERPAYMENT/OVERPAYMENT.
+        # This lets collect_balance_now() self-reject when the owner chose khata,
+        # before any irreversible DB action happens.
+        await _stamp_resolution_hint(store_context.telegram_user_id, user_message)
+
         # Context is passed so that context-bound wrappers can bake in
         # telegram_user_id and store_id — the LLM never sees those IDs.
         tools = get_tools_for_state(store_context.workflow_state, self.mcps, store_context, intent)
@@ -184,7 +204,11 @@ class KiranaAgent:
                     system_prompt=system_prompt,
                     tools=tools,
                     output_type=str,
-                    model_settings=ModelSettings(max_tokens=max_tokens, timeout=30.0),
+                    model_settings=ModelSettings(
+                        max_tokens=max_tokens,
+                        timeout=30.0,
+                        temperature=settings.LLM_TEMPERATURE,
+                    ),
                 )
                 result = await agent.run(
                     user_message,

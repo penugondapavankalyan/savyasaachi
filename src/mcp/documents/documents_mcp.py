@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from src.mcp.analytics.analytics_mcp import AnalyticsMCP
     from src.mcp.billing.billing_mcp import BillingMCP
     from src.mcp.identity.identity_mcp import IdentityMCP
+    from src.mcp.payments.payments_mcp import PaymentsMCP
 
 # ---------------------------------------------------------------------------
 # State code → state name mapping (separate from system_prompt.py copy)
@@ -119,8 +120,8 @@ _ACTIVE_PDF_THEME = "default"
 # Replace the empty string with the real URL when ready, e.g.:
 #   _SAVYASAACHI_URL = "https://savyasaachi.com"
 # ---------------------------------------------------------------------------
-_SAVYASAACHI_URL: str = "https://savyasaachi.com"   # ← fill in when URL is ready
-
+# _SAVYASAACHI_URL: str = "https://savyasaachi.com"   # ← fill in when URL is ready
+_SAVYASAACHI_URL: str = os.environ.get("SAVYASAACHI_INVOICE_URL", "")   # ← fill in when URL is ready
 
 def _theme() -> dict:
     """Return the active PDF theme dict."""
@@ -156,10 +157,12 @@ class DocumentsMCP:
         billing_mcp: "BillingMCP",
         analytics_mcp: "AnalyticsMCP",
         identity_mcp: "IdentityMCP",
+        payments_mcp: "PaymentsMCP | None" = None,
     ) -> None:
         self._billing = billing_mcp
         self._analytics = analytics_mcp
         self._identity = identity_mcp
+        self._payments = payments_mcp
 
     # ------------------------------------------------------------------
     # PDF Invoice
@@ -182,9 +185,75 @@ class DocumentsMCP:
         if not store:
             raise ValueError("Store not found for this user.")
 
+        from src.utils.ist import now_ist as _now_ist
         th         = _theme()
         state_name = _STATE_NAMES.get(store.state_code, store.state_code)
         bill_date  = bill.created_at[:10] if bill.created_at else date.today().isoformat()
+        gen_ts     = _now_ist().strftime("%Y-%m-%d, %H:%M:%S")
+
+        # ── Fetch payment row (best-effort; None for PENDING_PAYMENT) ────
+        pmt = None
+        if self._payments:
+            try:
+                pmt = await self._payments.get_payment_by_bill(bill.bill_id)
+            except Exception:
+                pmt = None
+
+        # ── Derive payment detail values ─────────────────────────────────
+        # Determine what to show for Paid / Change / Balance lines.
+        bill_status = bill.status  # CONFIRMED | CANCELLED | PENDING_PAYMENT | etc.
+
+        if bill_status == "CANCELLED":
+            paid_str    = "Rs. 0"
+            change_str  = "Rs. 0"
+            balance_str = "Rs. 0"
+        elif bill_status == "PENDING_PAYMENT" or pmt is None:
+            paid_str    = "Rs. 0"
+            change_str  = "Rs. 0"
+            balance_str = "Rs. 0"
+        else:
+            # pmt is available — derive values from payment row
+            paid_str = f"Rs. {pmt.paid_amount:.2f}"
+
+            if pmt.payment_type == "UNDERPAYMENT":
+                change_str  = "Rs. 0"
+                balance_str = f"Rs. {pmt.balance_due:.2f} (added to khata)"
+            elif pmt.payment_type in ("OVERPAYMENT", "EXACT") and pmt.change_amount > 0:
+                # Overpayment: check if change was returned (no khata_entry_id) or added to khata
+                if pmt.khata_entry_id:
+                    change_str = f"Rs. {pmt.change_amount:.2f} (added to khata)"
+                else:
+                    change_str = f"Rs. {pmt.change_amount:.2f} (change returned)"
+                balance_str = "Rs. 0"
+            elif pmt.payment_type == "KHATA":
+                # Full credit sale — customer owes entire bill amount
+                paid_str    = "Rs. 0"
+                change_str  = "Rs. 0"
+                balance_str = f"Rs. {bill.total_amount:.2f} (added to khata)"
+            else:
+                # EXACT with no change
+                change_str  = "Rs. 0"
+                balance_str = "Rs. 0"
+
+        # ── Fetch customer name/phone if customer_id is present ──────────
+        cust_name  = "NA"
+        cust_phone = "NA"
+        if bill.customer_id:
+            try:
+                cust_resp = (
+                    self._billing.db.schema("billing")
+                    .table("customers")
+                    .select("name, phone")
+                    .eq("id", bill.customer_id)
+                    .limit(1)
+                    .execute()
+                )
+                cust_rows = cust_resp.data or []
+                if cust_rows:
+                    cust_name  = cust_rows[0].get("name") or "NA"
+                    cust_phone = cust_rows[0].get("phone") or "NA"
+            except Exception:
+                pass
 
         pdf = FPDF(unit="mm", format="A4")
         pdf.set_margins(left=10, top=10, right=10)
@@ -193,16 +262,26 @@ class DocumentsMCP:
 
         # ── Header block ────────────────────────────────────────────────
         # Left column  : shop name + address + phone + GSTIN + state
-        # Right column : bill meta (Bill No / Date / Payment)
+        # Right column : bill meta (Bill No / Date / Payment / Status /
+        #                Paid / Change / Balance / Cust Name / Cust Phone)
         # Both columns start at the same Y, side-by-side.
 
         PAGE_W   = 190   # usable width (A4 210mm − 2×10mm margins)
         LEFT_W   = 110   # width of shop-info column
         RIGHT_W  = 80    # width of bill-meta column
-        LABEL_W  = 28    # label cell width inside right column
+        LABEL_W  = 32    # label cell width inside right column
         VALUE_W  = RIGHT_W - LABEL_W
+        RH       = 4     # row height for right-column meta rows (mm)
 
         header_start_y = pdf.get_y()
+
+        # ── Helper: emit one label+value row in the right column ─────────
+        def _right_row(label: str, value: str, bold_value: bool = True) -> None:
+            pdf.set_font("Helvetica", "", 8)
+            pdf.set_text_color(*th["body_text"])
+            pdf.cell(LABEL_W, RH, label, align="L", ln=False)
+            pdf.set_font("Helvetica", "B" if bold_value else "", 8)
+            pdf.cell(VALUE_W, RH, value, align="L", ln=True)
 
         # --- Left: shop name (large, accented) ---
         pdf.set_font("Helvetica", "B", 18)
@@ -210,66 +289,69 @@ class DocumentsMCP:
         pdf.set_text_color(r, g, b)
         pdf.cell(LEFT_W, 9, store.shop_name.title(), ln=False)
 
-        # --- Right: Bill No label + value (first row) ---
-        pdf.set_font("Helvetica", "", 9)
+        # --- Right: Bill No (taller first row to align with shop name height) ---
+        pdf.set_font("Helvetica", "", 8)
         pdf.set_text_color(*th["body_text"])
         pdf.cell(LABEL_W, 9, "Bill No.", align="L", ln=False)
-        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_font("Helvetica", "B", 8)
         pdf.cell(VALUE_W, 9, bill.bill_number, align="L", ln=True)
 
-        # --- Left: address in grey ---
+        # --- Left: address ---
         left_after_name_y = pdf.get_y()
         pdf.set_font("Helvetica", "", 8)
         pdf.set_text_color(*th["address_fg"])
-        if store.address:
-            pdf.cell(LEFT_W, 5, store.address, ln=False)
-        else:
-            pdf.cell(LEFT_W, 5, "", ln=False)
+        pdf.cell(LEFT_W, RH, store.address or "", ln=False)
 
-        # --- Right: Date label + value ---
-        pdf.set_font("Helvetica", "", 9)
-        pdf.set_text_color(*th["body_text"])
-        pdf.cell(LABEL_W, 5, "Date", align="L", ln=False)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.cell(VALUE_W, 5, bill_date, align="L", ln=True)
+        # --- Right: Date ---
+        _right_row("Date", bill_date)
 
         # --- Left: phone ---
         pdf.set_font("Helvetica", "", 8)
         pdf.set_text_color(*th["address_fg"])
-        if store.phone:
-            pdf.cell(LEFT_W, 5, f"Phone: {store.phone}", ln=False)
-        else:
-            pdf.cell(LEFT_W, 5, "", ln=False)
+        pdf.cell(LEFT_W, RH, f"Phone: {store.phone}" if store.phone else "", ln=False)
 
-        # --- Right: Payment label + value ---
-        pdf.set_font("Helvetica", "", 9)
-        pdf.set_text_color(*th["body_text"])
-        pdf.cell(LABEL_W, 5, "Payment", align="L", ln=False)
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.cell(VALUE_W, 5, bill.payment_mode, align="L", ln=True)
+        # --- Right: Payment mode ---
+        _right_row("Payment", bill.payment_mode)
 
         # --- Left: GSTIN ---
         pdf.set_font("Helvetica", "", 8)
         pdf.set_text_color(*th["address_fg"])
-        if store.gstin:
-            pdf.cell(LEFT_W, 5, f"GSTIN: {store.gstin}", ln=False)
-        else:
-            pdf.cell(LEFT_W, 5, "", ln=False)
+        pdf.cell(LEFT_W, RH, f"GSTIN: {store.gstin}" if store.gstin else "", ln=False)
 
-        # --- Right: Ref (only if present, else blank) ---
-        if bill.payment_reference:
-            pdf.set_font("Helvetica", "", 9)
-            pdf.set_text_color(*th["body_text"])
-            pdf.cell(LABEL_W, 5, "Ref", align="L", ln=False)
-            pdf.set_font("Helvetica", "B", 9)
-            pdf.cell(VALUE_W, 5, bill.payment_reference, align="L", ln=True)
-        else:
-            pdf.ln(5)
+        # --- Right: Status ---
+        _right_row("Status", bill_status.replace("_", " "))
 
         # --- Left: State ---
         pdf.set_font("Helvetica", "", 8)
         pdf.set_text_color(*th["address_fg"])
-        pdf.cell(LEFT_W, 5, f"State: {state_name} ({store.state_code})", ln=True)
+        pdf.cell(LEFT_W, RH, f"State: {state_name} ({store.state_code})", ln=False)
+
+        # --- Right: Paid ---
+        _right_row("Paid", paid_str)
+
+        # --- Left: blank (no more left content) ---
+        pdf.cell(LEFT_W, RH, "", ln=False)
+
+        # --- Right: Change ---
+        _right_row("Change", change_str)
+
+        # --- Left: blank ---
+        pdf.cell(LEFT_W, RH, "", ln=False)
+
+        # --- Right: Balance ---
+        _right_row("Balance", balance_str)
+
+        # --- Left: blank ---
+        pdf.cell(LEFT_W, RH, "", ln=False)
+
+        # --- Right: Customer name ---
+        _right_row("Customer", cust_name)
+
+        # --- Left: blank ---
+        pdf.cell(LEFT_W, RH, "", ln=False)
+
+        # --- Right: Customer phone ---
+        _right_row("Cust. Phone", cust_phone, bold_value=False)
 
         # --- Horizontal divider ---
         pdf.ln(2)
@@ -303,17 +385,27 @@ class DocumentsMCP:
         # Placed immediately after the footer line above — no absolute positioning.
         # "Powered by " in very light grey; "Savyasaachi" bold + slightly darker grey.
         pdf.ln(1)
+        # ── Footer last line: "Generated at …" left  |  "Powered by Savyasaachi" right ──
+        # Compute widths first so both can share the same Y line.
         pdf.set_font("Helvetica", "", 7)
-        pdf.set_text_color(200, 200, 200)
-        _prefix   = "Powered by "
-        _prefix_w = pdf.get_string_width(_prefix)
+        _gen_label   = f"Generated at {gen_ts}"
+        _gen_w       = pdf.get_string_width(_gen_label)
+        _prefix      = "Powered by "
+        _prefix_w    = pdf.get_string_width(_prefix)
         pdf.set_font("Helvetica", "B", 7)
-        _brand_w  = pdf.get_string_width("Savyasaachi")
-        # Position so the two-part text ends flush at the right margin (x=200)
-        pdf.set_x(200 - _prefix_w - _brand_w)
+        _brand_w     = pdf.get_string_width("Savyasaachi")
+        _right_total = _prefix_w + _brand_w
+
+        # "Generated at" — left margin, muted
+        pdf.set_x(10)
         pdf.set_font("Helvetica", "", 7)
         pdf.set_text_color(200, 200, 200)
-        pdf.cell(_prefix_w, 4, _prefix)
+        pdf.cell(_gen_w, 4, _gen_label, ln=False)
+
+        # "Powered by Savyasaachi" — flush right, same line
+        pdf.set_x(200 - _right_total)
+        pdf.set_text_color(200, 200, 200)
+        pdf.cell(_prefix_w, 4, _prefix, ln=False)
         pdf.set_font("Helvetica", "B", 7)
         pdf.set_text_color(160, 160, 160)
         if _SAVYASAACHI_URL:
@@ -1275,7 +1367,7 @@ def _stock_item_list(slide, items, C_GREEN_STOCK, C_ORANGE, C_RED, C_DARK, C_MID
         name = item.product_name or ""
         brand = (item.brand or "").strip()
         if brand:
-            label = f"{name} ({brand.lower()})"
+            label = f"{name} ({brand.title()})"
         else:
             label = name
         return label[:26]
