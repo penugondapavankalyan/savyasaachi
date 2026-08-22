@@ -378,7 +378,7 @@ class DocumentsMCP:
 
         pdf.set_font("Helvetica", "", 8)
         pdf.set_text_color(*th["address_fg"])
-        pdf.cell(0, 5, "Thank you for your business!", align="C", ln=True)
+        pdf.cell(0, 5, "Thank you. Visit Again!!", align="C", ln=True)
         pdf.cell(0, 4, "This is a computer-generated invoice and does not require a signature.", align="C", ln=True)
 
         # ── "Powered by Savyasaachi" — inline, right-aligned, two-part ──

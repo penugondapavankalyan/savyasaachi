@@ -27,6 +27,24 @@ from typing import Callable
 from src.agent.config import StoreContext
 from src.mcp import MCPInstances
 
+# ── New-product copyable template ─────────────────────────────────────────────
+# Appended to search_products "not found" returns so the owner can tap Copy,
+# edit the values, and paste back — works as a code block on Telegram & WhatsApp.
+_NEW_PRODUCT_TEMPLATE = (
+    "\n\nHere is a sample format:\n"
+    "```\n"
+    "Name: \n"
+    "Type: Branded / Loose\n"
+    "Unit: KG / G / L / ML / PIECE / PACKET / DOZEN / BUNDLE\n"
+    "Cost price (₹): \n"
+    "Selling price / MRP (₹): \n"
+    "GST rate: 0 / 5 / 12 / 18 / 28  (0 for loose, mandatory for branded)\n"
+    "Brand: \n"
+    "Reorder level: \n"
+    "Current stock: \n"
+    "```"
+)
+
 
 def get_tools_for_state(
     workflow_state: str,
@@ -173,20 +191,23 @@ def _build_pending_catalogue_tools(
         - hsn_code: HSN code if known, None if not
         """
         from src.mcp.catalogue.models import AddProductResult
-        result: AddProductResult = await mcps.catalogue.add_product(
-            store_id=store_id,
-            name=name,
-            is_loose=is_loose,
-            unit=unit,
-            cost_price=cost_price,
-            mrp=mrp,
-            reorder_level=reorder_level,
-            brand=brand,
-            hsn_code=hsn_code,
-            gst_rate=gst_rate,
-            telegram_user_id=tuid,
-        )
-        return result.message
+        try:
+            result: AddProductResult = await mcps.catalogue.add_product(
+                store_id=store_id,
+                name=name,
+                is_loose=is_loose,
+                unit=unit,
+                cost_price=cost_price,
+                mrp=mrp,
+                reorder_level=reorder_level,
+                brand=brand,
+                hsn_code=hsn_code,
+                gst_rate=gst_rate,
+                telegram_user_id=tuid,
+            )
+            return result.message
+        except Exception as e:
+            return f"ERROR: {e}"
 
     async def list_products() -> str:
         """List all products currently in the catalogue with their full product IDs."""
@@ -206,13 +227,18 @@ def _build_pending_catalogue_tools(
         return "\n".join(lines)
 
     async def search_products(query: str) -> str:
-        """Search for a product by name. Returns matching products with their full product IDs."""
+        """Search for a product by name. Returns matching products with their full product IDs.
+        Always use the SINGULAR base form of the name — never plural.
+        CORRECT: query='pencil'   INCORRECT: query='pencils'
+        Never include brand in query — name only.
+        CORRECT: query='pencil'   INCORRECT: query='natraj pencil'
+        """
         from src.mcp.catalogue.models import ProductResult
         products: list[ProductResult] = await mcps.catalogue.search_products(
             store_id=store_id, query=query
         )
         if not products:
-            return f"No products found matching '{query}'."
+            return f"No products found matching '{query}'." + _NEW_PRODUCT_TEMPLATE
         lines = [
             f"Products matching '{query}' "
             f"[internal — product_ids below are for tool calls only, NEVER show to owner]:"
@@ -243,18 +269,21 @@ def _build_pending_catalogue_tools(
         Only pass fields that should change — others remain untouched.
         Editable: name, brand, unit, is_loose, cost_price, mrp, reorder_level, gst_rate, hsn_code.
         """
-        result = await mcps.catalogue.update_product_details(
-            store_id=store_id,
-            product_id=product_id,
-            name=name, brand=brand, unit=unit, is_loose=is_loose,
-            cost_price=cost_price, mrp=mrp, reorder_level=reorder_level,
-            gst_rate=gst_rate, hsn_code=hsn_code,
-        )
-        brand_str = f" ({result.brand})" if result.brand else ""
-        return (
-            f"Updated: {result.name}{brand_str} | {result.unit} | "
-            f"Cost Rs.{result.cost_price} | MRP Rs.{result.mrp} | GST {result.gst_rate}%"
-        )
+        try:
+            result = await mcps.catalogue.update_product_details(
+                store_id=store_id,
+                product_id=product_id,
+                name=name, brand=brand, unit=unit, is_loose=is_loose,
+                cost_price=cost_price, mrp=mrp, reorder_level=reorder_level,
+                gst_rate=gst_rate, hsn_code=hsn_code,
+            )
+            brand_str = f" ({result.brand})" if result.brand else ""
+            return (
+                f"Updated: {result.name}{brand_str} | {result.unit} | "
+                f"Cost Rs.{result.cost_price} | MRP Rs.{result.mrp} | GST {result.gst_rate}%"
+            )
+        except Exception as e:
+            return f"ERROR: {e}"
 
     async def update_store(
         shop_name: str | None = None,
@@ -268,19 +297,22 @@ def _build_pending_catalogue_tools(
         Editable fields: shop_name, phone, address, state_code, default_payment_mode.
         Only pass fields that should change.
         """
-        result = await mcps.identity.update_store(
-            store_id=store_id,
-            shop_name=shop_name,
-            phone=phone,
-            address=address,
-            state_code=state_code,
-            default_payment_mode=default_payment_mode,
-        )
-        return (
-            f"Store updated: {result.shop_name} | Phone: {result.phone or 'not set'} | "
-            f"Address: {result.address or 'not set'} | State: {result.state_code} | "
-            f"Payment: {result.default_payment_mode}"
-        )
+        try:
+            result = await mcps.identity.update_store(
+                store_id=store_id,
+                shop_name=shop_name,
+                phone=phone,
+                address=address,
+                state_code=state_code,
+                default_payment_mode=default_payment_mode,
+            )
+            return (
+                f"Store updated: {result.shop_name} | Phone: {result.phone or 'not set'} | "
+                f"Address: {result.address or 'not set'} | State: {result.state_code} | "
+                f"Payment: {result.default_payment_mode}"
+            )
+        except Exception as e:
+            return f"ERROR: {e}"
 
     async def update_owner_name(
         first_name: str | None = None,
@@ -326,13 +358,18 @@ def _build_pending_inventory_tools(
         return "\n".join(lines)
 
     async def search_products(query: str) -> str:
-        """Search for a product by name. Returns matching products with their full product IDs."""
+        """Search for a product by name. Returns matching products with their full product IDs.
+        Always use the SINGULAR base form of the name — never plural.
+        CORRECT: query='pencil'   INCORRECT: query='pencils'
+        Never include brand in query — name only.
+        CORRECT: query='pencil'   INCORRECT: query='natraj pencil'
+        """
         from src.mcp.catalogue.models import ProductResult
         products: list[ProductResult] = await mcps.catalogue.search_products(
             store_id=store_id, query=query
         )
         if not products:
-            return f"No products found matching '{query}'."
+            return f"No products found matching '{query}'." + _NEW_PRODUCT_TEMPLATE
         lines = [
             f"Products matching '{query}' "
             f"[internal — product_ids below are for tool calls only, NEVER show to owner]:"
@@ -353,14 +390,17 @@ def _build_pending_inventory_tools(
         - notes: optional note (e.g. supplier name)
         """
         from src.mcp.inventory.models import ReceiveStockResult
-        result: ReceiveStockResult = await mcps.inventory.receive_stock(
-            store_id=store_id,
-            product_id=product_id,
-            quantity=quantity,
-            notes=notes,
-            telegram_user_id=tuid,
-        )
-        return result.message
+        try:
+            result: ReceiveStockResult = await mcps.inventory.receive_stock(
+                store_id=store_id,
+                product_id=product_id,
+                quantity=quantity,
+                notes=notes,
+                telegram_user_id=tuid,
+            )
+            return result.message
+        except Exception as e:
+            return f"ERROR: {e}"
 
     async def add_product(
         name: str,
@@ -395,20 +435,23 @@ def _build_pending_inventory_tools(
         The product_id is saved server-side — receive_stock() resolves it automatically.
         """
         from src.mcp.catalogue.models import AddProductResult
-        result: AddProductResult = await mcps.catalogue.add_product(
-            store_id=store_id,
-            name=name,
-            is_loose=is_loose,
-            unit=unit,
-            cost_price=cost_price,
-            mrp=mrp,
-            reorder_level=reorder_level,
-            brand=brand,
-            hsn_code=hsn_code,
-            gst_rate=gst_rate,
-            telegram_user_id=tuid,
-        )
-        return result.message + f"\n[internal product_id={result.product_id} — use for receive_stock, do NOT show to owner]"
+        try:
+            result: AddProductResult = await mcps.catalogue.add_product(
+                store_id=store_id,
+                name=name,
+                is_loose=is_loose,
+                unit=unit,
+                cost_price=cost_price,
+                mrp=mrp,
+                reorder_level=reorder_level,
+                brand=brand,
+                hsn_code=hsn_code,
+                gst_rate=gst_rate,
+                telegram_user_id=tuid,
+            )
+            return result.message + f"\n[internal product_id={result.product_id} — use for receive_stock, do NOT show to owner]"
+        except Exception as e:
+            return f"ERROR: {e}"
 
     async def update_product_details(
         product_id: str,
@@ -427,18 +470,21 @@ def _build_pending_inventory_tools(
         Use product_id from list_products or search_products (full UUID).
         Only pass fields that should change — others remain untouched.
         """
-        result = await mcps.catalogue.update_product_details(
-            store_id=store_id,
-            product_id=product_id,
-            name=name, brand=brand, unit=unit, is_loose=is_loose,
-            cost_price=cost_price, mrp=mrp, reorder_level=reorder_level,
-            gst_rate=gst_rate, hsn_code=hsn_code,
-        )
-        brand_str = f" ({result.brand})" if result.brand else ""
-        return (
-            f"Updated: {result.name}{brand_str} | {result.unit} | "
-            f"Cost Rs.{result.cost_price} | MRP Rs.{result.mrp} | GST {result.gst_rate}%"
-        )
+        try:
+            result = await mcps.catalogue.update_product_details(
+                store_id=store_id,
+                product_id=product_id,
+                name=name, brand=brand, unit=unit, is_loose=is_loose,
+                cost_price=cost_price, mrp=mrp, reorder_level=reorder_level,
+                gst_rate=gst_rate, hsn_code=hsn_code,
+            )
+            brand_str = f" ({result.brand})" if result.brand else ""
+            return (
+                f"Updated: {result.name}{brand_str} | {result.unit} | "
+                f"Cost Rs.{result.cost_price} | MRP Rs.{result.mrp} | GST {result.gst_rate}%"
+            )
+        except Exception as e:
+            return f"ERROR: {e}"
 
     async def update_store(
         shop_name: str | None = None,
@@ -448,16 +494,19 @@ def _build_pending_inventory_tools(
         default_payment_mode: str | None = None,
     ) -> str:
         """Update store details. Only pass fields that should change."""
-        result = await mcps.identity.update_store(
-            store_id=store_id, shop_name=shop_name, phone=phone,
-            address=address, state_code=state_code,
-            default_payment_mode=default_payment_mode,
-        )
-        return (
-            f"Store updated: {result.shop_name} | Phone: {result.phone or 'not set'} | "
-            f"Address: {result.address or 'not set'} | State: {result.state_code} | "
-            f"Payment: {result.default_payment_mode}"
-        )
+        try:
+            result = await mcps.identity.update_store(
+                store_id=store_id, shop_name=shop_name, phone=phone,
+                address=address, state_code=state_code,
+                default_payment_mode=default_payment_mode,
+            )
+            return (
+                f"Store updated: {result.shop_name} | Phone: {result.phone or 'not set'} | "
+                f"Address: {result.address or 'not set'} | State: {result.state_code} | "
+                f"Payment: {result.default_payment_mode}"
+            )
+        except Exception as e:
+            return f"ERROR: {e}"
 
     async def update_owner_name(first_name: str | None = None, last_name: str | None = None) -> str:
         """Update the owner's name on their profile."""
@@ -534,9 +583,14 @@ def _build_active_tools(
         Search for a product by name. Returns full product_id and details.
 
         QUERY RULES:
-        - Search by product name ONLY — never combine name + brand in query.
-          CORRECT:   search_products(query='Pencil')
-          INCORRECT: search_products(query='Pencil Natraj')  ← brand is NOT part of name
+        - ALWAYS use the SINGULAR base form — never plural.
+          CORRECT:   search_products(query='pencil')
+          INCORRECT: search_products(query='pencils')  ← plural misses results
+          If owner says 'natraj pencils', search for 'pencil' not 'pencils'.
+        - Search by product name ONLY — never include brand in query.
+          CORRECT:   search_products(query='pencil')
+          INCORRECT: search_products(query='natraj pencil')  ← brand belongs in brand field
+          If owner says 'natraj pencils', search for 'pencil' — the DB finds brand automatically.
         - If this tool already returned results earlier this turn or the previous turn,
           do NOT call it again — use the product_id already in your context.
         - If the owner disambiguates from a prior multi-result response (e.g. says 'natraj'
@@ -550,9 +604,14 @@ def _build_active_tools(
         if not products:
             return (
                 f"No products found matching '{query}'.\n"
-                f"⚠️ STOP — ask the owner first: "
-                f"'{query} is not in the catalogue. Do you want to add it, or skip it?'\n"
-                f"Wait for the owner's answer before collecting any product details."
+                f"⚠️ STOP — do NOT paraphrase or reformat what follows. "
+                f"Send the owner EXACTLY this message, word for word, code block included:\n"
+                f"---\n"
+                f"{query} is not in the catalogue. Do you want to add it or skip it?\n"
+                + _NEW_PRODUCT_TEMPLATE
+                + f"\n---\n"
+                f"Wait for the owner's reply before collecting any details. "
+                f"If they say yes/add, collect the filled-in fields from their next message."
             )
         lines = [
             f"Products matching '{query}' "
@@ -639,16 +698,20 @@ def _build_active_tools(
                 )
         return "\n".join(lines)
 
-    async def generate_invoice_pdf(bill_number_or_id: str) -> str:
+    async def generate_invoice_pdf(bill_number_or_id: str | None = None) -> str:
         """
-        Generate and send a PDF invoice for a finalized bill to this Telegram chat.
+        Generate and send a PDF invoice for ANY bill — confirmed, voided, refunded, or
+        cancelled. Bill status does NOT matter — always generate when asked.
 
-        USE WHEN: owner asks 'send invoice for BL-003-20260815-013', 'PDF for this bill',
-        'share bill as PDF', 'generate invoice'.
+        USE WHEN: owner asks 'generate invoice', 'send invoice', 'PDF for this bill',
+        'share bill as PDF', 'invoice for BL-003-...', or any similar request.
+        NEVER refuse to generate because a bill was voided or cancelled — the owner
+        may need a record of any transaction regardless of its status.
 
-        - bill_number_or_id: either the human bill number (e.g. BL-003-20260815-013)
-          OR the bill UUID from get_bills_by_date / get_payment_history.
-          If only a bill number is known, pass it — the tool resolves the bill_id internally.
+        - bill_number_or_id: the human bill number (e.g. BL-003-20260815-013) OR bill UUID.
+          If the [internal voided_bill_number=...] hint is present in context, use that value.
+          If no bill number is known, pass None or omit — the tool fetches the most
+          recent bill for this store automatically.
 
         Sends the PDF directly to the owner's Telegram chat and deletes the temp file.
         Returns a confirmation message.
@@ -658,17 +721,39 @@ def _build_active_tools(
         from src.telegram.telegram_client import get_telegram_client
 
         resolved_bill_id: str | None = None
-        if _clean_uuid(bill_number_or_id):
-            resolved_bill_id = bill_number_or_id
-        else:
-            # Lookup by bill_number
+
+        if bill_number_or_id:
+            if _clean_uuid(bill_number_or_id):
+                resolved_bill_id = bill_number_or_id
+            else:
+                # Lookup by bill_number — no status filter, works for any status
+                try:
+                    resp = (
+                        mcps.billing.db.schema("billing")
+                        .table("bills")
+                        .select("id")
+                        .eq("store_id", store_id)
+                        .eq("bill_number", bill_number_or_id.strip())
+                        .limit(1)
+                        .execute()
+                    )
+                    rows = resp.data or []
+                    if rows:
+                        resolved_bill_id = rows[0]["id"]
+                except Exception:
+                    pass
+
+        if not resolved_bill_id:
+            # No bill number given (or lookup failed) — fall back to most recent bill
+            # for this store regardless of status.
             try:
                 resp = (
                     mcps.billing.db.schema("billing")
                     .table("bills")
                     .select("id")
                     .eq("store_id", store_id)
-                    .eq("bill_number", bill_number_or_id.strip())
+                    .not_.in_("status", ["OPEN", "CANCELLED_DRAFT"])
+                    .order("created_at", desc=True)
                     .limit(1)
                     .execute()
                 )
@@ -680,8 +765,8 @@ def _build_active_tools(
 
         if not resolved_bill_id:
             return (
-                f"ERROR: Could not find bill '{bill_number_or_id}'. "
-                "Use get_bills_by_date() or get_payment_history() to find the correct bill number."
+                "ERROR: No bills found for this store. "
+                "Please complete a bill first before generating an invoice."
             )
 
         try:
@@ -814,28 +899,34 @@ def _build_active_tools(
         ) -> str:
             """Add a new product to the catalogue after owner confirmation."""
             from src.mcp.catalogue.models import AddProductResult
-            result: AddProductResult = await mcps.catalogue.add_product(
-                store_id=store_id, name=name, is_loose=is_loose, unit=unit,
-                cost_price=cost_price, mrp=mrp, reorder_level=reorder_level,
-                brand=brand, hsn_code=hsn_code, gst_rate=gst_rate, telegram_user_id=tuid,
-            )
-            return (
-                result.message
-                + f"\n[product_id={result.product_id}]"
-                + "\nMANDATORY NEXT STEPS (same turn):"
-                + "\n  1. If owner provided initial stock quantity → call receive_stock(product_id, qty) NOW."
-                + "\n  2. If this product was requested for the current bill → after receive_stock, call check_availability then add_item_to_draft(product_id, requested_qty)."
-                + "\n  Do NOT skip add_item_to_draft — the product must be added to the bill explicitly."
-            )
+            try:
+                result: AddProductResult = await mcps.catalogue.add_product(
+                    store_id=store_id, name=name, is_loose=is_loose, unit=unit,
+                    cost_price=cost_price, mrp=mrp, reorder_level=reorder_level,
+                    brand=brand, hsn_code=hsn_code, gst_rate=gst_rate, telegram_user_id=tuid,
+                )
+                return (
+                    result.message
+                    + f"\n[product_id={result.product_id}]"
+                    + "\nMANDATORY NEXT STEPS (same turn):"
+                    + "\n  1. If owner provided initial stock quantity → call receive_stock(product_id, qty) NOW."
+                    + "\n  2. If this product was requested for the current bill → after receive_stock, call check_availability then add_item_to_draft(product_id, requested_qty)."
+                    + "\n  Do NOT skip add_item_to_draft — the product must be added to the bill explicitly."
+                )
+            except Exception as e:
+                return f"ERROR: {e}"
 
         async def receive_stock(product_id: str, quantity: float, notes: str | None = None) -> str:
             """Record received stock for a product."""
             from src.mcp.inventory.models import ReceiveStockResult
-            result: ReceiveStockResult = await mcps.inventory.receive_stock(
-                store_id=store_id, product_id=product_id,
-                quantity=quantity, notes=notes, telegram_user_id=tuid,
-            )
-            return result.message
+            try:
+                result: ReceiveStockResult = await mcps.inventory.receive_stock(
+                    store_id=store_id, product_id=product_id,
+                    quantity=quantity, notes=notes, telegram_user_id=tuid,
+                )
+                return result.message
+            except Exception as e:
+                return f"ERROR: {e}"
 
         async def update_product_details(
             product_id: str,
@@ -856,14 +947,17 @@ def _build_active_tools(
                     f"ERROR: '{product_id}' is not a valid product_id UUID. "
                     "Call list_products() or search_products() first to get the real UUID."
                 )
-            result = await mcps.catalogue.update_product_details(
-                store_id=store_id, product_id=product_id,
-                name=name, brand=brand, unit=unit, is_loose=is_loose,
-                cost_price=cost_price, mrp=mrp, reorder_level=reorder_level,
-                gst_rate=gst_rate, hsn_code=hsn_code,
-            )
-            brand_str = f" ({result.brand})" if result.brand else ""
-            return f"Updated: {result.name}{brand_str} | {result.unit} | MRP Rs.{result.mrp} | GST {result.gst_rate}%"
+            try:
+                result = await mcps.catalogue.update_product_details(
+                    store_id=store_id, product_id=product_id,
+                    name=name, brand=brand, unit=unit, is_loose=is_loose,
+                    cost_price=cost_price, mrp=mrp, reorder_level=reorder_level,
+                    gst_rate=gst_rate, hsn_code=hsn_code,
+                )
+                brand_str = f" ({result.brand})" if result.brand else ""
+                return f"Updated: {result.name}{brand_str} | {result.unit} | MRP Rs.{result.mrp} | GST {result.gst_rate}%"
+            except Exception as e:
+                return f"ERROR: {e}"
 
         async def deactivate_product(product_id: str) -> str:
             """Remove a product from the catalogue (soft delete). Use full product_id."""
@@ -879,12 +973,15 @@ def _build_active_tools(
             default_payment_mode: str | None = None,
         ) -> str:
             """Update store details. Only pass fields that should change."""
-            result = await mcps.identity.update_store(
-                store_id=store_id, shop_name=shop_name, phone=phone,
-                address=address, state_code=state_code,
-                default_payment_mode=default_payment_mode,
-            )
-            return f"Store updated: {result.shop_name} | Phone: {result.phone or 'not set'} | State: {result.state_code}"
+            try:
+                result = await mcps.identity.update_store(
+                    store_id=store_id, shop_name=shop_name, phone=phone,
+                    address=address, state_code=state_code,
+                    default_payment_mode=default_payment_mode,
+                )
+                return f"Store updated: {result.shop_name} | Phone: {result.phone or 'not set'} | State: {result.state_code}"
+            except Exception as e:
+                return f"ERROR: {e}"
 
         async def update_owner_name(first_name: str | None = None, last_name: str | None = None) -> str:
             """Update the owner's name on their profile."""
@@ -982,11 +1079,25 @@ def _build_active_tools(
             return str(result)
 
         async def get_stock_movements(product_id: str) -> str:
-            """Get stock movement history for a product."""
-            result = await mcps.inventory.get_stock_movements(
+            """Get stock movement history for a product (last 50, newest first)."""
+            from src.mcp.inventory.models import StockMovementRecord
+            movements: list[StockMovementRecord] = await mcps.inventory.get_stock_movements(
                 store_id=store_id, product_id=product_id
             )
-            return str(result)
+            if not movements:
+                return "No stock movements found for this product."
+            lines = [
+                f"{'Date':<19}  {'Type':<10}  {'Qty':>6}  {'Ref':<10}  Notes",
+                f"{'-'*19}  {'-'*10}  {'-'*6}  {'-'*10}  -----",
+            ]
+            for m in movements:
+                date = m.created_at[:19].replace("T", " ")
+                qty = f"+{m.quantity_delta}" if m.quantity_delta >= 0 else str(m.quantity_delta)
+                # Show reference type only — never expose raw UUIDs
+                ref = m.reference_type if m.reference_type else "-"
+                notes = m.notes or "-"
+                lines.append(f"{date:<19}  {m.movement_type:<10}  {qty:>6}  {ref:<10}  {notes}")
+            return "```\n" + "\n".join(lines) + "\n```"
 
         return [search_products, receive_stock, get_stock, get_all_stock,
                 check_availability, get_low_stock_items, get_stock_movements]
@@ -999,11 +1110,14 @@ def _build_active_tools(
             Add or find a customer by phone number.
             phone is MANDATORY for all credit customers (10-digit Indian mobile).
             """
-            result = await mcps.khata.add_customer(
-                store_id=store_id, name=name, phone=phone
-            )
-            # Return only the human message — avoids LLM misreading raw balance float
-            return f"[internal customer_id={result.customer_id} — use for finalize_bill/add_credit_entry, do NOT show to owner]\n{result.message}"
+            try:
+                result = await mcps.khata.add_customer(
+                    store_id=store_id, name=name, phone=phone
+                )
+                # Return only the human message — avoids LLM misreading raw balance float
+                return f"[internal customer_id={result.customer_id} — use for finalize_bill/add_credit_entry, do NOT show to owner]\n{result.message}"
+            except Exception as e:
+                return f"ERROR: {e}"
 
         async def get_customer(name_or_phone: str) -> str:
             """Look up a customer by name or phone number."""
@@ -1198,17 +1312,23 @@ def _build_active_tools(
 
         async def get_balance(customer_id: str) -> str:
             """Get the current outstanding balance for a customer."""
-            result = await mcps.khata.get_balance(
-                store_id=store_id, customer_id=customer_id
-            )
-            return result.message
+            try:
+                result = await mcps.khata.get_balance(
+                    store_id=store_id, customer_id=customer_id
+                )
+                return result.message
+            except Exception as e:
+                return f"ERROR: {e}"
 
         async def get_khata_history(customer_id: str) -> str:
             """Get full transaction history for a customer."""
-            result = await mcps.khata.get_khata_history(
-                store_id=store_id, customer_id=customer_id
-            )
-            return str(result)
+            try:
+                result = await mcps.khata.get_khata_history(
+                    store_id=store_id, customer_id=customer_id
+                )
+                return str(result)
+            except Exception as e:
+                return f"ERROR: {e}"
 
         return [search_products, add_customer, get_customer, add_credit_entry,
                 add_payment_entry, get_balance, get_khata_history, list_customers_with_balances,
@@ -1560,13 +1680,16 @@ def _build_active_tools(
             return (
                 "ERROR: No active draft bill found. Call create_draft_bill() first to start a bill."
             )
-        result = await mcps.billing.finalize_bill(
-            draft_bill_id=resolved_id,
-            payment_mode=payment_mode,
-            telegram_user_id=tuid,
-            is_credit=is_credit,
-            customer_id=customer_id,
-        )
+        try:
+            result = await mcps.billing.finalize_bill(
+                draft_bill_id=resolved_id,
+                payment_mode=payment_mode,
+                telegram_user_id=tuid,
+                is_credit=is_credit,
+                customer_id=customer_id,
+            )
+        except Exception as e:
+            return f"ERROR: {e}"
         # Store bill_id so confirm_payment/cancel_bill/void_bill can resolve it
         # automatically — the LLM never needs to pass it.
         _bill_id_cell[0] = result.bill_id
@@ -1965,11 +2088,14 @@ def _build_active_tools(
                     f"  2. add_payment_entry(customer_id) — amount=None reads ₹{_delta:.2f} from Redis automatically."
                 )
 
-        bill_id    = intent["bill_id"]
-        bill_num   = intent["bill_number"]
-        bill_total = float(intent["bill_amount"])
-        paid       = float(intent["paid_amount"])
-        mode       = intent["payment_mode"]
+        try:
+            bill_id    = intent["bill_id"]
+            bill_num   = intent["bill_number"]
+            bill_total = float(intent["bill_amount"])
+            paid       = float(intent["paid_amount"])
+            mode       = intent["payment_mode"]
+        except (KeyError, TypeError, ValueError) as e:
+            return f"ERROR: Payment intent data is incomplete or corrupted ({e}). Please try again or send /new."
         subtotal   = float(intent.get("subtotal") or 0) or None
         total_gst  = float(intent.get("total_gst") or 0) or None
         resolved_customer_id = intent.get("customer_id")
@@ -2425,7 +2551,7 @@ def _build_active_tools(
             _vb_resp = (
                 mcps.billing.db.schema("billing")
                 .table("bills")
-                .select("id")
+                .select("id, bill_number")
                 .eq("store_id", store_id)
                 .eq("status", "CONFIRMED")
                 .order("created_at", desc=True)
@@ -2434,12 +2560,19 @@ def _build_active_tools(
             )
             _vb_rows = _vb_resp.data or []
             resolved_bill_id = _vb_rows[0]["id"] if _vb_rows else None
+            resolved_bill_number = _vb_rows[0].get("bill_number") if _vb_rows else None
         except Exception:
             resolved_bill_id = None
+            resolved_bill_number = None
         if not resolved_bill_id:
             return "ERROR: No CONFIRMED bill found to void."
         result = await mcps.billing.void_bill(bill_id=resolved_bill_id)
-        return result.message
+        bill_ref = f" (bill {resolved_bill_number})" if resolved_bill_number else ""
+        return result.message + bill_ref + (
+            f"\n[internal voided_bill_number={resolved_bill_number} — "
+            f"use this for generate_invoice_pdf if owner asks for invoice]"
+            if resolved_bill_number else ""
+        )
 
     async def void_bill_by_number(bill_number_or_id: str) -> str:
         """
@@ -2488,10 +2621,13 @@ def _build_active_tools(
         ALWAYS call get_customer(name_or_phone) first — only call add_customer if the customer is not found.
         phone is MANDATORY (10-digit Indian mobile number). Never call with a placeholder phone.
         """
-        result = await mcps.khata.add_customer(
-            store_id=store_id, name=name, phone=phone
-        )
-        return f"[internal customer_id={result.customer_id} — use for finalize_bill/add_credit_entry, do NOT show to owner]\n{result.message}"
+        try:
+            result = await mcps.khata.add_customer(
+                store_id=store_id, name=name, phone=phone
+            )
+            return f"[internal customer_id={result.customer_id} — use for finalize_bill/add_credit_entry, do NOT show to owner]\n{result.message}"
+        except Exception as e:
+            return f"ERROR: {e}"
 
     async def get_customer(name_or_phone: str) -> str:
         """Look up a customer by name or phone."""
@@ -2900,13 +3036,16 @@ def _build_active_tools(
         The product_id is saved server-side — receive_stock() resolves it automatically.
         """
         from src.mcp.catalogue.models import AddProductResult
-        result: AddProductResult = await mcps.catalogue.add_product(
-            store_id=store_id, name=name, is_loose=is_loose, unit=unit,
-            cost_price=cost_price, mrp=mrp, reorder_level=reorder_level,
-            brand=brand, hsn_code=hsn_code, gst_rate=gst_rate, telegram_user_id=tuid,
-        )
-        _last_added_product_id_cell[0] = result.product_id
-        return result.message + f"\n[internal product_id={result.product_id} — use for receive_stock + add_item_to_draft, do NOT show to owner]"
+        try:
+            result: AddProductResult = await mcps.catalogue.add_product(
+                store_id=store_id, name=name, is_loose=is_loose, unit=unit,
+                cost_price=cost_price, mrp=mrp, reorder_level=reorder_level,
+                brand=brand, hsn_code=hsn_code, gst_rate=gst_rate, telegram_user_id=tuid,
+            )
+            _last_added_product_id_cell[0] = result.product_id
+            return result.message + f"\n[internal product_id={result.product_id} — use for receive_stock + add_item_to_draft, do NOT show to owner]"
+        except Exception as e:
+            return f"ERROR: {e}"
 
     async def receive_stock(product_id: str, quantity: float, notes: str | None = None) -> str:
         """
@@ -2927,11 +3066,14 @@ def _build_active_tools(
                 "ERROR: No product_id available. Call add_product() first, "
                 "then call receive_stock() with the returned product_id."
             )
-        result: ReceiveStockResult = await mcps.inventory.receive_stock(
-            store_id=store_id, product_id=resolved_pid,
-            quantity=quantity, notes=notes, telegram_user_id=tuid,
-        )
-        return result.message
+        try:
+            result: ReceiveStockResult = await mcps.inventory.receive_stock(
+                store_id=store_id, product_id=resolved_pid,
+                quantity=quantity, notes=notes, telegram_user_id=tuid,
+            )
+            return result.message
+        except Exception as e:
+            return f"ERROR: {e}"
 
     # ── BILLING_CONFIRM intent — post-finalize tools (no active draft) ────────
     if intent == "BILLING_CONFIRM":

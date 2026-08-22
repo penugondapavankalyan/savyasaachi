@@ -384,17 +384,21 @@ class CatalogueMCP:
         named 'Pencil' with brand 'Apsara'.
         Returns up to 10 results ordered by name.
         """
-        # Build a set of search terms: original query + stemmed variants.
-        # Strip common English plural/suffix endings so "pencils" → "pencil",
-        # "sugars" → "sugar", "biscuits" → "biscuit", etc.
+        # ── Stem helper ───────────────────────────────────────────────────
+        def _stem_word(w: str) -> str:
+            """Strip one common plural/suffix ending from a single word."""
+            for suffix in ("ies", "es", "s"):
+                if w.endswith(suffix) and len(w) > len(suffix) + 2:
+                    return w[: -len(suffix)]
+            return w
+
+        # Build search terms: original query + whole-query stemmed variant.
+        # "pencils" → "pencil", "biscuits" → "biscuit", "sugars" → "sugar".
         terms: list[str] = [query.strip()]
         q_lower = query.strip().lower()
-        for suffix in ("ies", "es", "s"):
-            if q_lower.endswith(suffix) and len(q_lower) > len(suffix) + 2:
-                stem = q_lower[: -len(suffix)]
-                if stem not in [t.lower() for t in terms]:
-                    terms.append(stem)
-                break  # only strip one suffix
+        stemmed_q = _stem_word(q_lower)
+        if stemmed_q != q_lower and stemmed_q not in [t.lower() for t in terms]:
+            terms.append(stemmed_q)
 
         seen_ids: set[str] = set()
         results: list[dict] = []
@@ -443,16 +447,18 @@ class CatalogueMCP:
                 if results:
                     break
 
-        # Cross-field pass for multi-word queries (e.g. "apsara pencil"):
-        # Try each individual word as a name match, then verify in-memory that
-        # at least one of the remaining words appears in the brand field.
-        # This catches products like name="Pencil", brand="Apsara" which the
-        # whole-phrase passes above would miss entirely.
+        # Cross-field pass for multi-word queries (e.g. "natraj pencils"):
+        # Stem each individual word so "pencils" → "pencil" before the ilike.
+        # Try each word as a name match, then verify in-memory that at least
+        # one of the remaining words appears in the brand field.
+        # Catches: name="Pencil", brand="Natraj" from query "natraj pencils".
         if not results:
-            words = q_lower.split()
+            # Use stemmed individual words so plural forms match singular names
+            raw_words = q_lower.split()
+            words = [_stem_word(w) for w in raw_words]
             if len(words) > 1:
-                for name_word in words:
-                    other_words = [w for w in words if w != name_word]
+                for i, name_word in enumerate(words):
+                    other_words = [w for j, w in enumerate(words) if j != i]
                     resp3 = (
                         _base_q()
                         .ilike("name", f"%{name_word}%")

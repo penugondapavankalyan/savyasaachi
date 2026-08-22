@@ -22,6 +22,7 @@ Quantity rules by unit:
 from __future__ import annotations
 
 import re
+import unicodedata
 import uuid
 from typing import Optional
 
@@ -154,10 +155,17 @@ _UNIT_REASON: dict[str, str] = {
 # ── Core sanitisers ───────────────────────────────────────────────────────────
 
 def clean_optional_str(value: Optional[str]) -> Optional[str]:
-    """Return None if value is empty/placeholder, else return stripped value."""
+    """Return None if value is empty/placeholder, else return stripped value.
+
+    Applies Unicode NFKC normalisation before comparison — collapses lookalike
+    characters (Cyrillic а vs Latin a, zero-width spaces, bidirectional
+    overrides) to their canonical ASCII equivalents so bypass tricks fail.
+    """
     if value is None:
         return None
-    v = value.strip()
+    # NFKC: compatibility decomposition then canonical composition.
+    # Strips zero-width chars and maps lookalikes to ASCII equivalents.
+    v = unicodedata.normalize("NFKC", value).strip()
     if v.lower() in _NULL_STRINGS:
         return None
     return v

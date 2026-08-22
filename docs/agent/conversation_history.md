@@ -41,6 +41,35 @@ conv:112233445    → Another user's history
 
 ---
 
+## Rate Limit Key
+
+A third Redis key enforces per-user message rate limiting:
+
+```
+Key:    rate:{telegram_user_id}
+Type:   Integer counter
+TTL:    60 seconds (fixed from first hit — NOT sliding)
+```
+
+The counter is incremented atomically via `INCR` on every message. If the count exceeds 20, the message is rejected before the agent is called. The TTL is set **only on the first hit** (count == 1) so the 60-second window is fixed — not extended by each new message. The counter auto-expires after 60 seconds, resetting the window.
+
+Methods: `is_rate_limited()` in `src/redis/upstash_client.py`.
+
+---
+
+## History Poisoning Guard
+
+When `get_conversation()` loads history from Redis, it strips any stored message whose `content` field matches a known prompt-injection pattern before returning the list to the agent. This prevents a malicious message that slipped into Redis (e.g. before the handler-level injection filter was added) from re-injecting itself into every future agent call in that session.
+
+```python
+# Applied inside get_conversation() on every load
+messages = [m for m in messages if not _contains_injection(m.get("content", ""))]
+```
+
+The injection pattern (`_INJECTION_RE`) is defined at module level in `upstash_client.py` and matches the same phrases as the handler-level guard in `handler.py`.
+
+---
+
 ## Pending Payment Intent Key
 
 A second Redis key is used to bridge multi-turn over/underpayment resolution:

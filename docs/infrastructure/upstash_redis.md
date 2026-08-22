@@ -60,10 +60,24 @@ Examples:
   pending_payment:987654321   → Ramesh's pending overpayment of ₹70
 ```
 
+```
+Pattern:  rate:{telegram_user_id}
+Type:     Integer counter
+TTL:      60 seconds (fixed from first hit — NOT sliding)
+Purpose:  Per-user rate limiting. Incremented on every message.
+          If counter > 20 within the 60s window, the message is rejected
+          before reaching the agent.
+          TTL is set only on count == 1 so the window is fixed, not sliding.
+          Degrades gracefully: Redis error → treated as not rate-limited.
+
+Examples:
+  rate:987654321   → Ramesh's message count in current window
+```
+
 Phase 2 future keys:
 ```
 pref:{store_id}    → Cached preferences (not needed — already in Supabase)
-rate:{user_id}     → Rate limiting counters
+summary:{telegram_user_id} → Compressed older conversation context
 ```
 
 ---
@@ -141,11 +155,28 @@ Free tier storage: 256MB → supports **~6,400 users** at 40KB each.
 
 ---
 
+## Free Tier Usage Estimate (Updated)
+
+With rate limiting added, each message now makes up to **3** Redis requests (instead of 2):
+
+| Operation | Redis requests |
+|---|---|
+| Load conversation history (GET) | 1 |
+| Rate limit INCR (POST pipeline) | 1 |
+| Rate limit EXPIRE — first hit only (POST pipeline) | 1 |
+| Save updated history (POST pipeline) | 1 |
+
+Worst case per message: **4 requests** (first message of a new rate window).
+Typical case: **3 requests** (INCR only, no EXPIRE).
+
+Free tier (10,000 req/day) → supports **~2,500–3,300 messages/day**.
+
+---
+
 ## Phase 2 Extensibility
 
 | Feature | Change |
 |---|---|
 | Multi-store per user | Key: `conv:{telegram_user_id}:{store_id}` |
-| Rate limiting | Add `rate:{telegram_user_id}` key with INCR + TTL |
 | Conversation summarization | Add `summary:{telegram_user_id}` for compressed older context |
 | Distributed locking | Use `SET key value NX EX seconds` for distributed lock (e.g., prevent concurrent finalizations) |
