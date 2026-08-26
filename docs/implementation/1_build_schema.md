@@ -373,29 +373,99 @@ Apply `migrations/013_create_rpcs.sql` containing:
 - `generate_bill_number` — sequential bill number
 - `upsert_workflow_state` — idempotent workflow state init
 
+Also apply later migrations for bill status RPCs:
+- `migrations/014_bill_status_flow.sql` — `confirm_payment`, `cancel_bill`, `void_bill` RPCs + bill status transition trigger
+- `migrations/019_add_set_bill_customer_rpc.sql` — `set_bill_customer` RPC
+
 ---
 
-## Step 12: Validation Checklist
+## Step 12: Create Payments Schema
+
+```sql
+-- migrations/020_create_payments_schema.sql
+
+CREATE SCHEMA IF NOT EXISTS payments;
+
+-- Payment type enum
+CREATE TYPE payments.payment_type AS ENUM (
+    'EXACT', 'OVERPAYMENT', 'UNDERPAYMENT', 'KHATA', 'KHATA_SETTLE'
+);
+
+-- Payment status enum
+CREATE TYPE payments.pay_status AS ENUM (
+    'CONFIRMED', 'PENDING', 'CANCELLED', 'REFUNDED'
+);
+
+CREATE TABLE payments.payments (
+    payment_id          UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
+    store_id            UUID            NOT NULL REFERENCES identity.stores(id) ON DELETE RESTRICT,
+    bill_id             UUID            REFERENCES billing.bills(id) ON DELETE RESTRICT,
+    customer_id         UUID            REFERENCES billing.customers(id) ON DELETE RESTRICT,
+    khata_entry_id      UUID            REFERENCES khata.khata_entries(id) ON DELETE RESTRICT,
+    payment_mode        TEXT            NOT NULL,
+    payment_type        payments.payment_type NOT NULL,
+    payment_status      payments.pay_status   NOT NULL DEFAULT 'CONFIRMED',
+    paid_amount         NUMERIC(10,2)   NOT NULL,
+    bill_amount         NUMERIC(10,2),
+    subtotal            NUMERIC(10,2),
+    total_gst           NUMERIC(10,2),
+    change_amount       NUMERIC(10,2)   NOT NULL DEFAULT 0,
+    balance_due         NUMERIC(10,2)   NOT NULL DEFAULT 0,
+    payment_reference   TEXT,
+    created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+    -- No updated_at — this table is IMMUTABLE
+);
+
+-- Immutability trigger (same pattern as bills/bill_items)
+CREATE TRIGGER prevent_payments_mutation
+BEFORE UPDATE OR DELETE ON payments.payments
+FOR EACH ROW EXECUTE FUNCTION public.prevent_immutable_record_mutation();
+
+-- Indexes
+CREATE INDEX idx_payments_store_id     ON payments.payments (store_id);
+CREATE INDEX idx_payments_bill_id      ON payments.payments (bill_id);
+CREATE INDEX idx_payments_customer_id  ON payments.payments (customer_id);
+CREATE INDEX idx_payments_created_at   ON payments.payments (store_id, created_at DESC);
+```
+
+**After running this migration:**
+- Go to Supabase Dashboard → Project Settings → API → Exposed schemas
+- Add `payments` to the list (alongside `identity`, `catalogue`, etc.)
+
+---
+
+## Step 13: Validation Checklist
 
 After applying all migrations, verify:
 
 ```sql
--- Check all tables exist
-SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;
--- Expected: 13 tables
+-- Check all tables exist in public (legacy schemas — now all in named schemas)
+SELECT schemaname, tablename FROM pg_tables
+WHERE schemaname IN ('identity','catalogue','inventory','billing','khata','analytics','payments')
+ORDER BY schemaname, tablename;
+-- Expected: 14 tables across 7 schemas
 
 -- Check all enums exist
-SELECT typname FROM pg_type WHERE typtype = 'e' ORDER BY typname;
--- Expected: 7 enums
+SELECT n.nspname, t.typname FROM pg_type t
+JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE t.typtype = 'e' ORDER BY n.nspname, t.typname;
 
 -- Test the decrement_stock RPC exists
 SELECT proname FROM pg_proc WHERE proname = 'decrement_stock';
 
 -- Test loose item GST trigger
-INSERT INTO products (..., is_loose=TRUE, gst_rate=5) ...;
+INSERT INTO catalogue.products (..., is_loose=TRUE, gst_rate=5) ...;
 -- Should RAISE EXCEPTION
 
 -- Test immutability trigger on bills
-INSERT INTO bills (...); -- succeeds
-UPDATE bills SET total_amount = 0 WHERE id = ...; -- should RAISE EXCEPTION
+INSERT INTO billing.bills (...); -- succeeds
+UPDATE billing.bills SET total_amount = 0 WHERE id = ...; -- should RAISE EXCEPTION
+
+-- Test payments immutability
+INSERT INTO payments.payments (...); -- succeeds
+UPDATE payments.payments SET paid_amount = 0 WHERE payment_id = ...; -- should RAISE EXCEPTION
+
+-- Test bill status transition trigger
+-- confirm_payment RPC on a CONFIRMED bill should raise exception
+-- void_bill RPC on a PENDING_PAYMENT bill should raise exception
 ```

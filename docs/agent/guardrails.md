@@ -6,6 +6,34 @@
 
 ## Overview
 
+Guardrails operate at two distinct layers:
+
+1. **Input-layer guards** — enforced at `handler.py` before the LLM is ever called. These block abuse, off-topic queries, and injection attacks deterministically.
+2. **Tool-layer / DB guards** — business rules enforced in MCP modules and the database. These ensure financial correctness even if the model's reasoning is imperfect.
+
+For a full description of the input-layer guards (length cap, scope filter, injection filter, rate limit, Unicode normalisation, history poisoning), see [`docs/security/security_guards.md`](../security/security_guards.md).
+
+---
+
+## Input-Layer Guards (Handler, pre-LLM)
+
+These are evaluated in order on every incoming Telegram message before any agent or DB call is made.
+
+| # | Guard | Threshold / Rule | Canned response |
+|---|---|---|---|
+| 11 | **Length cap** | > 500 characters | "Message too long..." |
+| 12 | **Injection pattern filter** | Known injection phrases (regex) | `OFF_TOPIC_REPLY` |
+| 13 | **Off-topic scope filter** | No store keyword + > 4 words | `OFF_TOPIC_REPLY` |
+| 14 | **Rate limit** | > 20 messages / 60 seconds | "Too many messages..." |
+| 15 | **Unicode NFKC normalisation** | Applied to all `clean_optional_str()` calls | Raises `ValueError` on invalid values |
+| 16 | **History poisoning strip** | Injection pattern in stored Redis history | Message silently removed from context |
+
+See [`docs/security/security_guards.md`](../security/security_guards.md) for implementation details.
+
+---
+
+## Tool-Layer / DB Guards (Business Rules)
+
 Guardrails are business rules enforced at the **tool layer** (MCP modules and database), not in the system prompt. A guardrail lives where the data changes — not where the language model runs. This ensures correctness even if the model's reasoning is imperfect.
 
 ---

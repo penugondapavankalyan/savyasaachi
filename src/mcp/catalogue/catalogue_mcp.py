@@ -378,35 +378,51 @@ class CatalogueMCP:
         Substring search on name and brand.
         Also tries stemmed variants of the query so that plural/suffix forms
         (e.g. 'pencils', 'sugars', 'biscuits') match the stored singular name.
+        For multi-word queries (e.g. 'apsara pencil'), also tries a cross-field
+        pass: each word is matched against name while the remaining words are
+        checked against brand in-memory, so 'apsara pencil' finds a product
+        named 'Pencil' with brand 'Apsara'.
         Returns up to 10 results ordered by name.
         """
-        base_q = (
-            self.db.schema("catalogue")
-            .table("products")
-            .select("*")
-            .eq("store_id", store_id)
-        )
-        if active_only:
-            base_q = base_q.eq("is_active", True)
+        # ── Stem helper ───────────────────────────────────────────────────
+        def _stem_word(w: str) -> str:
+            """Strip one common plural/suffix ending from a single word."""
+            for suffix in ("ies", "es", "s"):
+                if w.endswith(suffix) and len(w) > len(suffix) + 2:
+                    return w[: -len(suffix)]
+            return w
 
-        # Build a set of search terms: original query + stemmed variants.
-        # Strip common English plural/suffix endings so "pencils" → "pencil",
-        # "sugars" → "sugar", "biscuits" → "biscuit", etc.
+        # Build search terms: original query + whole-query stemmed variant.
+        # "pencils" → "pencil", "biscuits" → "biscuit", "sugars" → "sugar".
         terms: list[str] = [query.strip()]
         q_lower = query.strip().lower()
-        for suffix in ("ies", "es", "s"):
-            if q_lower.endswith(suffix) and len(q_lower) > len(suffix) + 2:
-                stem = q_lower[: -len(suffix)]
-                if stem not in [t.lower() for t in terms]:
-                    terms.append(stem)
-                break  # only strip one suffix
+        stemmed_q = _stem_word(q_lower)
+        if stemmed_q != q_lower and stemmed_q not in [t.lower() for t in terms]:
+            terms.append(stemmed_q)
 
         seen_ids: set[str] = set()
         results: list[dict] = []
 
+        def _base_q() -> object:
+            """Return a fresh base query (never reuse — builder mutates in-place)."""
+            q = (
+                self.db.schema("catalogue")
+                .table("products")
+                .select("*")
+                .eq("store_id", store_id)
+            )
+            if active_only:
+                q = q.eq("is_active", True)
+            return q
+
         for term in terms:
+            # Build a FRESH query each iteration — the supabase-py query builder
+            # mutates its internal params object in-place via .add().  Reusing the
+            # same base_q across iterations would accumulate ilike filters as AND
+            # conditions (e.g. name=ilike.%pencils% AND name=ilike.%pencil%) which
+            # can never both be satisfied simultaneously, always returning 0 rows.
             search_term = f"%{term}%"
-            resp = base_q.ilike("name", search_term).limit(10).execute()
+            resp = _base_q().ilike("name", search_term).limit(10).execute()
             for row in (resp.data or []):
                 if row["id"] not in seen_ids:
                     seen_ids.add(row["id"])
@@ -419,10 +435,7 @@ class CatalogueMCP:
             for term in terms:
                 search_term = f"%{term}%"
                 resp2 = (
-                    self.db.schema("catalogue")
-                    .table("products")
-                    .select("*")
-                    .eq("store_id", store_id)
+                    _base_q()
                     .ilike("brand", search_term)
                     .limit(10)
                     .execute()
@@ -433,6 +446,41 @@ class CatalogueMCP:
                         results.append(row)
                 if results:
                     break
+
+        # Cross-field pass for multi-word queries (e.g. "natraj pencils", "wheat aata"):
+        # Stem each individual word so "pencils" → "pencil" before the ilike.
+        # Try each word as a name match and collect ALL name hits — do NOT filter
+        # by whether the remaining words appear in the brand field.
+        #
+        # Rationale: the old brand-check was too strict —
+        #   "wheat aata" → name ILIKE '%wheat%' finds "Wheat Aaata" but then
+        #   drops it because "aata" ∉ brand "Aashirvaad" → zero results.
+        #   "nataraj pencil" (typo) → name ILIKE '%pencil%' finds both Natraj
+        #   and Apsara, but drops Natraj because "nataraj" ∉ "natraj" (substring
+        #   miss on the typo) → zero results.
+        #
+        # New behaviour: return ALL rows whose name matches any word from the
+        # query. If multiple products match (e.g. Natraj Pencil + Apsara Pencil),
+        # the agent shows them to the owner and asks which one — same as a plain
+        # single-word search returning multiple results.
+        if not results:
+            raw_words = q_lower.split()
+            words = [_stem_word(w) for w in raw_words]
+            if len(words) > 1:
+                for i, name_word in enumerate(words):
+                    resp3 = (
+                        _base_q()
+                        .ilike("name", f"%{name_word}%")
+                        .limit(50)
+                        .execute()
+                    )
+                    for row in (resp3.data or []):
+                        if row["id"] in seen_ids:
+                            continue
+                        seen_ids.add(row["id"])
+                        results.append(row)
+                    if results:
+                        break
 
         return [_row_to_product(r) for r in results]
 

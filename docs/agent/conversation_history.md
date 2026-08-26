@@ -41,6 +41,71 @@ conv:112233445    → Another user's history
 
 ---
 
+## Rate Limit Key
+
+A third Redis key enforces per-user message rate limiting:
+
+```
+Key:    rate:{telegram_user_id}
+Type:   Integer counter
+TTL:    60 seconds (fixed from first hit — NOT sliding)
+```
+
+The counter is incremented atomically via `INCR` on every message. If the count exceeds 20, the message is rejected before the agent is called. The TTL is set **only on the first hit** (count == 1) so the 60-second window is fixed — not extended by each new message. The counter auto-expires after 60 seconds, resetting the window.
+
+Methods: `is_rate_limited()` in `src/redis/upstash_client.py`.
+
+---
+
+## History Poisoning Guard
+
+When `get_conversation()` loads history from Redis, it strips any stored message whose `content` field matches a known prompt-injection pattern before returning the list to the agent. This prevents a malicious message that slipped into Redis (e.g. before the handler-level injection filter was added) from re-injecting itself into every future agent call in that session.
+
+```python
+# Applied inside get_conversation() on every load
+messages = [m for m in messages if not _contains_injection(m.get("content", ""))]
+```
+
+The injection pattern (`_INJECTION_RE`) is defined at module level in `upstash_client.py` and matches the same phrases as the handler-level guard in `handler.py`.
+
+---
+
+## Pending Payment Intent Key
+
+A second Redis key is used to bridge multi-turn over/underpayment resolution:
+
+```
+Key:    pending_payment:{telegram_user_id}
+Type:   String (JSON-encoded dict)
+TTL:    1800 seconds (30 minutes, NOT sliding)
+```
+
+This key is set by `confirm_payment` when it detects an overpayment or underpayment, and cleared once the owner resolves it (via `add_payment_entry` or `add_credit_entry`). It prevents the LLM from hallucinating delta amounts between turns.
+
+**`/new` does NOT clear this key** — the payment intent is tied to a specific bill, not to the conversation context.
+
+```json
+{
+  "intent_type": "OVERPAYMENT",
+  "delta_amount": 70.00,
+  "bill_id": "uuid",
+  "bill_number": "BL-001-20260101-001",
+  "bill_amount": 430.00,
+  "paid_amount": 500.00,
+  "payment_mode": "CASH",
+  "payment_reference": null,
+  "store_id": "uuid",
+  "subtotal": 400.00,
+  "total_gst": 30.00
+}
+```
+
+Methods: `set_pending_payment()`, `get_pending_payment()`, `clear_pending_payment()` in `src/redis/upstash_client.py`.
+
+---
+
+---
+
 ## Data Format
 
 The value is a JSON-encoded list of message objects:

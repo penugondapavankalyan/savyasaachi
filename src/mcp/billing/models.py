@@ -128,6 +128,7 @@ class BillDetailResult(BaseModel):
     payment_mode: str
     payment_reference: Optional[str]
     is_credit: bool
+    status: str
     created_at: str
 
 
@@ -139,3 +140,23 @@ class BillSummaryResult(BaseModel):
     is_credit: bool
     item_count: int
     created_at: str
+
+
+class ConfirmPaymentResult(BaseModel):
+    """
+    Returned by the confirm_payment tool in tool_registry.
+    Encapsulates the full outcome including payment_type detection
+    and any over/underpayment state stored in Redis.
+    """
+    bill_id: str
+    bill_number: str
+    bill_amount: float
+    paid_amount: float
+    payment_mode: str
+    payment_type: str               # EXACT | OVERPAYMENT | UNDERPAYMENT
+    payment_status: str             # CONFIRMED
+    change_amount: float            # overpayment: cash back to customer
+    balance_due: float              # underpayment: goes to khata
+    payment_id: Optional[str]       # set once payment row is inserted
+    message: str
+    requires_resolution: bool       # True if over/underpayment needs follow-up

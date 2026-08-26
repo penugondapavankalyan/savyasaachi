@@ -96,34 +96,30 @@ class Settings:
     # ---- LLM provider selector ----
     @property
     def LLM_PROVIDER(self) -> str:
-        """'groq' or 'ollama'"""
-        return _optional("LLM_PROVIDER", "groq")
+        """'ollama' (groq removed)"""
+        return _optional("LLM_PROVIDER", "ollama")
 
-    # ── Groq settings (used when LLM_PROVIDER=groq) ──────────────────────────
-
-    @property
-    def LLM_MODEL(self) -> str:
-        """Primary Groq model. Fallback chain tries this first."""
-        return _optional("LLM_MODEL", "qwen/qwen3.6-27b")
-
-    @property
-    def LLM_FALLBACK_MODELS(self) -> list[str]:
-        """
-        Comma-separated ordered fallback Groq model list.
-        Tried in order after LLM_MODEL fails.
-        """
-        raw = _optional(
-            "LLM_FALLBACK_MODELS",
-            "llama-3.3-70b-versatile,openai/gpt-oss-20b,openai/gpt-oss-120b",
-        )
-        return [m.strip() for m in raw.split(",") if m.strip()]
-
-    @property
-    def GROQ_API_KEY(self) -> str:
-        """Required when LLM_PROVIDER=groq."""
-        if self.LLM_PROVIDER == "groq":
-            return _require("GROQ_API_KEY")
-        return _optional("GROQ_API_KEY")
+    # ── Groq settings — commented out (not used) ─────────────────────────────
+    # @property
+    # def LLM_MODEL(self) -> str:
+    #     """Primary Groq model. Fallback chain tries this first."""
+    #     return _optional("LLM_MODEL", "qwen/qwen3.6-27b")
+    #
+    # @property
+    # def LLM_FALLBACK_MODELS(self) -> list[str]:
+    #     """Comma-separated ordered fallback Groq model list."""
+    #     raw = _optional(
+    #         "LLM_FALLBACK_MODELS",
+    #         "llama-3.3-70b-versatile,openai/gpt-oss-20b,openai/gpt-oss-120b",
+    #     )
+    #     return [m.strip() for m in raw.split(",") if m.strip()]
+    #
+    # @property
+    # def GROQ_API_KEY(self) -> str:
+    #     """Required when LLM_PROVIDER=groq."""
+    #     if self.LLM_PROVIDER == "groq":
+    #         return _require("GROQ_API_KEY")
+    #     return _optional("GROQ_API_KEY")
 
     # ── Ollama settings (used when LLM_PROVIDER=ollama) ──────────────────────
     # Ollama cloud API: https://ollama.com/v1/chat/completions (OpenAI-compatible)
@@ -158,14 +154,60 @@ class Settings:
         return _optional("OLLAMA_API_KEY", "ollama")  # local doesn't need a real key
 
 
+    # ---- LLM inference settings ----
+    @property
+    def LLM_TEMPERATURE(self) -> float:
+        """
+        Sampling temperature for the LLM (0.0 = deterministic, 1.0 = creative).
+        Low values are recommended for a billing agent to ensure consistent tool calls.
+        Defaults to 0.1 if LLM_TEMPERATURE is not set or invalid.
+        """
+        raw = _optional("LLM_TEMPERATURE", "")
+        if raw:
+            try:
+                val = float(raw)
+                if 0.0 <= val <= 2.0:
+                    return val
+            except ValueError:
+                pass
+        return 0.1  # safe default for a structured billing agent
+
     # ---- Lambda / runtime ----
     @property
     def LAMBDA_ENV(self) -> str:
         return _optional("LAMBDA_ENV", "dev")
 
     @property
+    def LOCAL_MODE(self) -> bool:
+        """
+        True when running via run_local.py (not on Lambda).
+        Set LOCAL_MODE=true in .env to enable local document preview.
+        When True, send_document() saves files to LOCAL_DOCS_OUTPUT_DIR
+        and opens them with the OS default viewer instead of posting to Telegram.
+        """
+        return _optional("LOCAL_MODE", "false").lower() in ("true", "1", "yes")
+
+    @property
+    def LOCAL_DOCS_OUTPUT_DIR(self) -> str:
+        """
+        Directory where generated PDFs/PPTXs are saved when LOCAL_MODE=true.
+        Defaults to a 'local_output' folder in the project root.
+        """
+        return _optional("LOCAL_DOCS_OUTPUT_DIR", str(_root / "local_output"))
+
+    @property
     def LAMBDA_FUNCTION_URL(self) -> str:
         return _optional("LAMBDA_FUNCTION_URL")
+
+    @property
+    def TELEGRAM_TEST_CHAT_ID(self) -> str:
+        """
+        Telegram chat ID used ONLY by run_local.py's /sendtg dev command to
+        validate real MarkdownV2 rendering against the live Telegram API.
+        Empty by default. NEVER read by production code (handler.py always
+        uses the real chat_id from the incoming webhook).
+        """
+        return _optional("TELEGRAM_TEST_CHAT_ID")
 
     # ---- Tuning ----
     @property

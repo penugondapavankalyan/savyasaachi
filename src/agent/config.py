@@ -9,9 +9,9 @@ from pydantic import BaseModel
 
 
 class AgentConfig(BaseModel):
-    llm_provider: str = "groq"           # 'groq' | 'ollama'
+    llm_provider: str = "ollama"         # 'ollama' only (groq removed)
     llm_model: str = "llama-3.3-70b-versatile"
-    groq_api_key: Optional[str] = None
+    # groq_api_key: Optional[str] = None  # unused — Groq removed
     ollama_base_url: str = "http://localhost:11434"
     max_history_messages: int = 20
     draft_bill_ttl_hours: int = 4
@@ -27,6 +27,8 @@ class StoreContext(BaseModel):
     owner_first_name: Optional[str] = None
     owner_last_name: Optional[str] = None
     gstin: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
     state_code: str = "29"
     state_name: str = "Karnataka"
     default_payment_mode: str = "CASH"

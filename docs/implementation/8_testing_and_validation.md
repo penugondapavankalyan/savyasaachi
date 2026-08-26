@@ -275,6 +275,125 @@ Expected:
 
 ---
 
+## Test Suite 5B: Payments System
+
+### T5B.1 — Exact Payment
+```
+Setup: Create and finalize a CASH bill for ₹152.72
+Input: "paid 152.72"
+Expected:
+  ✅ confirm_payment(paid_amount=152.72) called
+  ✅ bills.status → CONFIRMED
+  ✅ payments.payments row: type=EXACT, paid=152.72, change=0, balance_due=0
+  ✅ No Redis pending_payment key set
+  ✅ Agent: "✅ Payment confirmed! Bill paid in full."
+```
+
+### T5B.2 — Overpayment → Add to Khata
+```
+Setup: Create and finalize a CASH bill for ₹430
+Input msg 1: "paid 500"
+Expected (Turn 1):
+  ✅ bills.status → CONFIRMED
+  ✅ Redis pending_payment:{tuid} set with {intent_type: OVERPAYMENT, delta_amount: 70}
+  ✅ NO payments row inserted yet
+  ✅ Agent asks: "₹70 extra. Return change or add to khata?"
+
+Input msg 2: "add to khata for Ramesh"
+Expected (Turn 2):
+  ✅ get_customer("Ramesh") → customer_id
+  ✅ add_payment_entry(customer_id, amount=None) reads delta from Redis
+  ✅ khata entry created: PAYMENT -70 (shop now owes Ramesh ₹70 or reduces his debt)
+  ✅ payments row inserted: type=OVERPAYMENT, paid=500, change=70, khata_entry_id set
+  ✅ Redis key cleared
+```
+
+### T5B.3 — Underpayment → Add to Khata
+```
+Setup: Create and finalize a CASH bill for ₹200, customer is Ramesh
+Input msg 1: "paid 150"
+Expected (Turn 1):
+  ✅ bills.status → CONFIRMED
+  ✅ Redis pending_payment:{tuid}: {intent_type: UNDERPAYMENT, delta_amount: 50}
+  ✅ NO payments row inserted yet
+  ✅ Agent asks: "₹50 still due. Pay now or add to khata?"
+
+Input msg 2: "add to khata"
+Expected (Turn 2):
+  ✅ add_credit_entry(customer_id, amount=None) reads delta from Redis
+  ✅ khata entry created: CREDIT +50 (Ramesh owes ₹50 more)
+  ✅ payments row inserted: type=UNDERPAYMENT, paid=150, balance_due=50, khata_entry_id set
+  ✅ Redis key cleared
+```
+
+### T5B.4 — Credit Bill Payment Row
+```
+Setup: Finalize a CREDIT bill for Ramesh, amount ₹300
+Expected (same turn as finalize):
+  ✅ bills.status → CONFIRMED (auto-confirmed)
+  ✅ khata entry: CREDIT +300
+  ✅ payments row: type=KHATA, paid=0, bill_amount=300, balance_due=300, khata_entry_id set
+  ✅ confirm_payment tool NOT called and NOT needed
+```
+
+### T5B.5 — Standalone Khata Settlement
+```
+Input: "Ramesh paid ₹300 against his khata"
+Expected:
+  ✅ get_customer("Ramesh") → customer_id
+  ✅ add_payment_entry(customer_id, amount=300) — explicit amount (no Redis)
+  ✅ khata entry: PAYMENT -300
+  ✅ payments row: type=KHATA_SETTLE, paid=300, bill_id=null, khata_entry_id set
+```
+
+### T5B.6 — Cancel Bill Audit Row
+```
+Setup: Create and finalize a CASH bill (PENDING_PAYMENT)
+Input: Cancel the bill
+Expected:
+  ✅ bills.status → CANCELLED
+  ✅ payments row: payment_status=CANCELLED, paid_amount=0
+```
+
+### T5B.9 — Void Historical Bill by Bill Number
+```
+Setup: A CONFIRMED bill exists from a previous session, e.g. BL-003-20260815-009
+Input: "cancel BL-003-20260815-009"
+Expected:
+  ✅ detect_intent() routes to BILLING_CONFIRM (cancel/void keyword)
+  ✅ void_bill_by_number("BL-003-20260815-009") called (NOT void_bill())
+  ✅ DB lookup: billing.bills WHERE store_id=? AND bill_number='BL-003-20260815-009' → UUID resolved
+  ✅ BillingMCP.void_bill(bill_id=<resolved_uuid>) called
+  ✅ bills.status → VOID
+  ✅ Stock restored for all bill items
+  ✅ payments row: payment_status=REFUNDED
+  ✅ If bill not found: returns "ERROR: Could not find bill 'BL-003-...'. Use get_bills_by_date() to find the correct bill number."
+  ✅ If bill already VOID: returns "Bill is already voided." (from RPC)
+  ✅ If bill is PENDING_PAYMENT: returns "Only CONFIRMED bills can be voided..." (from RPC)
+```
+
+### T5B.7 — Payment History
+```
+Setup: Ramesh has 3 bills (2 credit, 1 cash), 2 khata settlements
+Input: "show Ramesh's payment history"
+Expected:
+  ✅ get_payment_history("Ramesh") called
+  ✅ Returns combined payments + bills sorted newest first
+  ✅ Shows outstanding_balance from KhataMCP.get_balance()
+  ✅ Shows total_paid (sum of CONFIRMED payment rows)
+```
+
+### T5B.8 — Redis Key Expiry (Edge Case)
+```
+Setup: Overpayment detected but owner doesn't resolve within 30 minutes
+Action: Redis key expires, owner tries "add to khata" 31 minutes later
+Expected:
+  ✅ add_payment_entry(amount=None) → "ERROR: amount is required when there is no pending overpayment intent."
+  ✅ Agent asks owner to re-state the overpayment amount
+```
+
+---
+
 ## Test Suite 6: Analytics
 
 ### T6.1 — Daily Summary

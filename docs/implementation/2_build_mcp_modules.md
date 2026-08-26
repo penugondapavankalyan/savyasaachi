@@ -19,7 +19,7 @@
 ```
 src/
 ├── mcp/
-│   ├── __init__.py
+│   ├── __init__.py             # MCPInstances container + get_mcp_instances() singleton
 │   ├── identity/
 │   │   ├── __init__.py
 │   │   ├── identity_mcp.py
@@ -44,11 +44,17 @@ src/
 │   │   ├── __init__.py
 │   │   ├── analytics_mcp.py
 │   │   └── models.py
-│   └── documents/
+│   ├── documents/
+│   │   ├── __init__.py
+│   │   ├── documents_mcp.py
+│   │   ├── pdf_renderer.py    # Abstract interface
+│   │   └── pptx_renderer.py   # python-pptx implementation
+│   └── payments/
 │       ├── __init__.py
-│       ├── documents_mcp.py
-│       ├── pdf_renderer.py    # Abstract interface
-│       └── pptx_renderer.py   # python-pptx implementation
+│       ├── payments_mcp.py    # PaymentsMCP — owns payments.payments
+│       └── models.py          # PaymentResult, PaymentHistoryResult, etc.
+├── redis/
+│   └── upstash_client.py      # Conversation history + pending_payment key
 └── db/
     └── supabase_client.py     # Singleton client
 ```
@@ -171,9 +177,12 @@ Build MCPs in this order — later modules call earlier ones:
 2. **Catalogue MCP** — no direct MCP calls (reads stores via DB)
 3. **Inventory MCP** — calls Catalogue MCP (`get_product`) and Identity MCP (`advance_workflow_state`)
 4. **Khata MCP** — no direct MCP calls
-5. **Billing MCP** — calls Catalogue MCP, Inventory MCP, Khata MCP
-6. **Analytics MCP** — reads from DB directly, calls Analytics query
-7. **Documents MCP** — calls Billing MCP, Analytics MCP
+5. **Billing MCP** — calls Catalogue MCP, Inventory MCP, Khata MCP, IdentityMCP; accepts `payments_mcp=None` (injected later)
+6. **Analytics MCP** — reads from DB directly
+7. **Documents MCP** — calls Billing MCP, Analytics MCP, Identity MCP
+8. **Payments MCP** — calls Khata MCP (for `get_balance` in `get_payment_history`)
+   - After constructing both, inject: `billing_mcp.set_payments_mcp(payments_mcp)`
+   - This late-binding is required because Billing depends on Payments (to record rows) but Payments depends on Khata (not Billing) — so Billing must be constructed before Payments, then Payments injected back in.
 
 ---
 
@@ -190,28 +199,47 @@ from src.mcp.billing.billing_mcp import BillingMCP
 from src.mcp.khata.khata_mcp import KhataMCP
 from src.mcp.analytics.analytics_mcp import AnalyticsMCP
 from src.mcp.documents.documents_mcp import DocumentsMCP
+from src.mcp.payments.payments_mcp import PaymentsMCP
 
 class MCPInstances:
+    """
+    Construction order respects dependency injection:
+        Identity → Catalogue → Inventory → Khata → Billing
+        → Analytics → Documents → Payments (last — needs Khata)
+
+    After construction, PaymentsMCP is late-bound into BillingMCP
+    via set_payments_mcp() to break the circular dependency:
+      - BillingMCP calls PaymentsMCP.record_payment()
+      - PaymentsMCP calls KhataMCP.get_balance()
+      → Build both, then inject Payments into Billing.
+    """
     def __init__(self):
         self.identity = IdentityMCP()
-        self.catalogue = CatalogueMCP()
-        self.inventory = InventoryMCP(catalogue_mcp=self.catalogue, identity_mcp=self.identity)
+        self.catalogue = CatalogueMCP(identity_mcp=self.identity)
+        self.inventory = InventoryMCP(
+            catalogue_mcp=self.catalogue,
+            identity_mcp=self.identity,
+        )
         self.khata = KhataMCP()
         self.billing = BillingMCP(
             catalogue_mcp=self.catalogue,
             inventory_mcp=self.inventory,
             khata_mcp=self.khata,
-            identity_mcp=self.identity
+            identity_mcp=self.identity,
         )
         self.analytics = AnalyticsMCP()
         self.documents = DocumentsMCP(
             billing_mcp=self.billing,
             analytics_mcp=self.analytics,
-            identity_mcp=self.identity
+            identity_mcp=self.identity,
         )
+        # Payments last — depends on KhataMCP
+        self.payments = PaymentsMCP(khata_mcp=self.khata)
+        # Late-bind PaymentsMCP into BillingMCP
+        self.billing.set_payments_mcp(self.payments)
 
 # Module-level singleton (reused across warm Lambda invocations)
-_mcp_instances: MCPInstances = None
+_mcp_instances: MCPInstances | None = None
 
 def get_mcp_instances() -> MCPInstances:
     global _mcp_instances
@@ -332,10 +360,18 @@ Use Supabase test database or mock the Supabase client with `unittest.mock`.
 
 ## Validation Checklist
 
-- [ ] All 7 MCP modules implemented with all tools from `docs/mcp/`
+- [ ] All 8 MCP modules implemented with all tools from `docs/mcp/`
 - [ ] Pydantic models defined for all inputs and outputs
 - [ ] GST computation tested with known values
 - [ ] Idempotency verified for register_user, create_store, finalize_bill
 - [ ] Oversell guard tested (concurrent requests or qty > stock)
 - [ ] Loose item GST enforcement tested (gst_rate must be 0)
+- [ ] `payments` schema exposed in Supabase Dashboard → API → Exposed schemas
+- [ ] PaymentsMCP late-binding verified: `billing._payments` is not None after MCPInstances()
+- [ ] confirm_payment tool inserts EXACT payment row; does NOT insert for OVER/UNDER
+- [ ] add_payment_entry(amount=None) reads from Redis pending_payment key
+- [ ] add_credit_entry(amount=None) reads from Redis pending_payment key
+- [ ] Redis pending_payment key cleared after resolution
+- [ ] Credit bill finalize inserts KHATA payment row with paid_amount=0
+- [ ] cancel_bill inserts CANCELLED audit row; void_bill inserts REFUNDED audit row
 - [ ] All unit tests pass

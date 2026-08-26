@@ -27,10 +27,12 @@ from src.db.supabase_client import get_client
 from src.mcp.analytics.models import (
     AnalyticsDeckData,
     CloseDayResult,
+    CustomerCreditSummary,
     DailySummaryResult,
     DailyTrendPoint,
     GSTSlabSummary,
     GSTSummaryResult,
+    KhataOverviewData,
     StockHealthItem,
     StockHealthReport,
     TopItemResult,
@@ -387,6 +389,116 @@ class AnalyticsMCP:
             by_slab=by_slab,
         )
 
+    async def get_khata_overview(
+        self,
+        store_id: str,
+        start_date: str,
+        end_date: str,
+    ) -> KhataOverviewData:
+        """Aggregate khata (credit ledger) data for the PPTX khata overview slide.
+
+        Two bulk queries only:
+        1. All khata_entries for the store → compute per-customer balances in Python
+        2. All billing.bills in the period with is_credit=True → credit-by-day totals
+        3. billing.customers for name/phone lookup (one query)
+        """
+        # ── 1. All customers ────────────────────────────────────────────
+        cust_resp = (
+            self.db.schema("billing")
+            .table("customers")
+            .select("id, name, phone")
+            .eq("store_id", store_id)
+            .eq("is_active", True)
+            .execute()
+        )
+        customers = {r["id"]: r for r in (cust_resp.data or [])}
+
+        # ── 2. All khata_entries → balance map ──────────────────────────
+        khata_resp = (
+            self.db.schema("khata")
+            .table("khata_entries")
+            .select("customer_id, amount_delta")
+            .eq("store_id", store_id)
+            .execute()
+        )
+        balance_map: dict[str, float] = {}
+        for entry in (khata_resp.data or []):
+            cid = entry["customer_id"]
+            balance_map[cid] = balance_map.get(cid, 0.0) + float(entry["amount_delta"])
+
+        # ── Compute summary stats ────────────────────────────────────────
+        total_credit_given = 0.0
+        total_shop_owes    = 0.0
+        credit_count       = 0
+        shop_owes_count    = 0
+        highest_debtor: CustomerCreditSummary | None   = None
+        highest_creditor: CustomerCreditSummary | None = None
+
+        for cid, balance in balance_map.items():
+            cust = customers.get(cid)
+            if not cust:
+                continue
+            if balance > 0:
+                total_credit_given += balance
+                credit_count += 1
+                if highest_debtor is None or balance > highest_debtor.balance:
+                    highest_debtor = CustomerCreditSummary(
+                        customer_id=cid, name=cust["name"],
+                        phone=cust["phone"], balance=balance,
+                    )
+            elif balance < 0:
+                total_shop_owes += abs(balance)
+                shop_owes_count += 1
+                if highest_creditor is None or abs(balance) > abs(highest_creditor.balance):
+                    highest_creditor = CustomerCreditSummary(
+                        customer_id=cid, name=cust["name"],
+                        phone=cust["phone"], balance=balance,
+                    )
+
+        # ── 3. Credit bills in period → credit-by-day ────────────────────
+        credit_bills_resp = (
+            self.db.schema("billing")
+            .table("bills")
+            .select("total_amount, created_at")
+            .eq("store_id", store_id)
+            .eq("is_credit", True)
+            .gte("created_at", date_range_iso(start_date, end_date)[0])
+            .lte("created_at", date_range_iso(start_date, end_date)[1])
+            .execute()
+        )
+        from datetime import datetime as _dt
+        from src.utils.ist import IST
+        day_credit: dict[str, float] = {}
+        for b in (credit_bills_resp.data or []):
+            try:
+                ts_str = b["created_at"]
+                if ts_str.endswith("Z"):
+                    ts_str = ts_str[:-1] + "+00:00"
+                day_key = _dt.fromisoformat(ts_str).astimezone(IST).date().isoformat()
+            except Exception:
+                day_key = b["created_at"][:10]
+            day_credit[day_key] = day_credit.get(day_key, 0.0) + float(b["total_amount"])
+
+        # Fill all days in range (zero if no credit that day)
+        from datetime import date as _date, timedelta as _td
+        credit_by_day: list[tuple[str, float]] = []
+        d = _date.fromisoformat(start_date)
+        e = _date.fromisoformat(end_date)
+        while d <= e:
+            dk = d.isoformat()
+            credit_by_day.append((dk, round(day_credit.get(dk, 0.0), 2)))
+            d += _td(days=1)
+
+        return KhataOverviewData(
+            total_credit_given=round(total_credit_given, 2),
+            total_shop_owes=round(total_shop_owes, 2),
+            credit_customer_count=credit_count,
+            shop_owes_customer_count=shop_owes_count,
+            highest_debtor=highest_debtor,
+            highest_creditor=highest_creditor,
+            credit_by_day=credit_by_day,
+        )
+
     async def get_analytics_deck_data(
         self,
         store_id: str,
@@ -394,22 +506,106 @@ class AnalyticsMCP:
         start_date: str,
         end_date: str,
     ) -> AnalyticsDeckData:
-        """Collect all data needed for the PPTX analytics deck."""
-        summary = await self.get_daily_summary(store_id, end_date)
-        sales_trend = await self.get_sales_trend(store_id, start_date, end_date)
-        top_items = await self.get_top_items(store_id, start_date, end_date)
-        stock_health = await self.get_stock_health(store_id)
-        gst_summary = await self.get_gst_summary(store_id, start_date, end_date)
+        """Collect all data needed for the PPTX analytics deck.
+
+        Uses a single bulk bills query to build daily_summaries — avoids
+        N per-day DB round-trips that caused timeouts on THIS_WEEK/THIS_MONTH.
+        """
+        from datetime import date as _date, timedelta as _td
+
+        summary       = await self.get_daily_summary(store_id, end_date)
+        sales_trend   = await self.get_sales_trend(store_id, start_date, end_date)
+        top_items     = await self.get_top_items(store_id, start_date, end_date)
+        stock_health  = await self.get_stock_health(store_id)
+        gst_summary   = await self.get_gst_summary(store_id, start_date, end_date)
+        khata_overview = await self.get_khata_overview(store_id, start_date, end_date)
+
+        # ── Build per-day summary rows with a SINGLE bulk query ──────────
+        # Fetch all bills for the whole period in one shot, then aggregate
+        # in Python per calendar day.  No per-day DB calls — avoids N×3
+        # sequential round-trips that caused request timeouts.
+        bulk_resp = (
+            self.db.schema("billing")
+            .table("bills")
+            .select(
+                "total_amount, total_cgst, total_sgst, payment_mode, is_credit, created_at"
+            )
+            .eq("store_id", store_id)
+            .gte("created_at", date_range_iso(start_date, end_date)[0])
+            .lte("created_at", date_range_iso(start_date, end_date)[1])
+            .execute()
+        )
+        all_bills = bulk_resp.data or []
+
+        # Group bills by IST calendar date (created_at is ISO timestamp with tz)
+        from datetime import timezone as _tz
+        from src.utils.ist import IST  # IST tzinfo object
+
+        day_buckets: dict[str, list[dict]] = {}
+        for b in all_bills:
+            # Parse timestamp and convert to IST date
+            try:
+                ts_str = b["created_at"]
+                # Handle both "+05:30" and "Z" suffixes
+                if ts_str.endswith("Z"):
+                    ts_str = ts_str[:-1] + "+00:00"
+                from datetime import datetime as _dt
+                ts = _dt.fromisoformat(ts_str).astimezone(IST)
+                day_key = ts.date().isoformat()
+            except Exception:
+                # Fallback: use raw date prefix
+                day_key = b["created_at"][:10]
+            day_buckets.setdefault(day_key, []).append(b)
+
+        # Build a DailySummaryResult for each calendar day in the period
+        daily_summaries: list[DailySummaryResult] = []
+        s = _date.fromisoformat(start_date)
+        e = _date.fromisoformat(end_date)
+        day = s
+        while day <= e:
+            dk = day.isoformat()
+            day_bills = day_buckets.get(dk, [])
+            bill_count   = len(day_bills)
+            total_sales  = sum(float(b["total_amount"]) for b in day_bills)
+            total_cgst   = sum(float(b["total_cgst"])   for b in day_bills)
+            total_sgst   = sum(float(b["total_sgst"])   for b in day_bills)
+            cash_sales   = sum(float(b["total_amount"]) for b in day_bills if b.get("payment_mode") == "CASH")
+            upi_sales    = sum(float(b["total_amount"]) for b in day_bills if b.get("payment_mode") == "UPI")
+            card_sales   = sum(float(b["total_amount"]) for b in day_bills if b.get("payment_mode") == "CARD")
+            credit_sales = sum(float(b["total_amount"]) for b in day_bills if b.get("is_credit"))
+            daily_summaries.append(
+                DailySummaryResult(
+                    summary_date=dk,
+                    bill_count=bill_count,
+                    total_sales=round(total_sales, 2),
+                    total_cgst=round(total_cgst, 2),
+                    total_sgst=round(total_sgst, 2),
+                    total_tax=round(total_cgst + total_sgst, 2),
+                    cash_sales=round(cash_sales, 2),
+                    upi_sales=round(upi_sales, 2),
+                    card_sales=round(card_sales, 2),
+                    credit_sales=round(credit_sales, 2),
+                    top_items=[],   # not needed for the PPTX daily table
+                    is_day_closed=False,
+                    message=(
+                        f"📊 {dk}: {bill_count} bills, ₹{total_sales:.2f} total."
+                        if bill_count else f"No bills on {dk}."
+                    ),
+                )
+            )
+            day += _td(days=1)
 
         period_label = f"{start_date} – {end_date}"
         return AnalyticsDeckData(
             store_name=store_name,
             period_label=period_label,
             summary=summary,
+            daily_summaries=daily_summaries,
             sales_trend=sales_trend,
             top_items=top_items,
             stock_health=stock_health,
             gst_summary=gst_summary,
+            khata_overview=khata_overview,
         )
 
     # ------------------------------------------------------------------

@@ -115,6 +115,8 @@ async def load_agent_context(telegram_user_id: int) -> StoreContext:
         owner_first_name=owner_first_name,
         owner_last_name=owner_last_name,
         gstin=store.gstin if store else None,
+        phone=store.phone if store else None,
+        address=store.address if store else None,
         state_code=state_code,
         state_name=state_name,
         default_payment_mode=store.default_payment_mode if store else "CASH",

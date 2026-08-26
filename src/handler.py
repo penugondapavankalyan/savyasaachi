@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
 from src.agent.context_loader import load_agent_context
@@ -37,9 +38,35 @@ from src.telegram.update_parser import (
     is_message_update,
     is_new_chat_command,
 )
+from src.utils.scope_guard import (
+    CATALOGUE_GATE_REPLY,
+    OFF_TOPIC_REPLY,
+    REGISTRATION_GATE_REPLY,
+    STALE_DRAFT_REPLY,
+    is_in_scope,
+    is_pending_catalogue_block,
+    is_stale_draft_greeting,
+    is_unregistered_block,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# ── Pre-LLM input guards ──────────────────────────────────────────────────────
+
+# Guard #1 — message length cap
+_MAX_MESSAGE_LENGTH = 500
+
+# Guard #3 — prompt injection pattern filter (pre-LLM, on raw user input)
+# Kept intentionally tight to avoid false positives on legitimate store messages.
+# History-stored injection patterns are handled separately in upstash_client.py.
+_INJECTION_RE = re.compile(
+    r"ignore (all |previous |prior |above |your )?(instructions?|rules?|prompt|guidelines?)|"
+    r"you are now|disregard|pretend (you are|to be)|act as [a-z]|jailbreak|"
+    r"system prompt|forget (everything|all)|new role|override (your|all|the)|"
+    r"do not follow|stop being|change your (role|behaviour|behavior)",
+    re.IGNORECASE,
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Async handler
@@ -68,15 +95,59 @@ async def async_handler(event: dict, context) -> dict:
     redis = UpstashRedisClient()
     mcps = get_mcp_instances()
 
+    # ── Pre-LLM input guards (before any agent / DB work) ─────────────────────
+
+    # Guard #1 — message length cap
+    if len(user_message) > _MAX_MESSAGE_LENGTH:
+        await telegram.send_message(
+            chat_id,
+            f"Message too long (max {_MAX_MESSAGE_LENGTH} characters). Please keep it concise.",
+        )
+        return {"statusCode": 200, "body": "OK"}
+
+    # Guard #3 — prompt injection filter
+    if _INJECTION_RE.search(user_message):
+        await telegram.send_message(chat_id, OFF_TOPIC_REPLY)
+        return {"statusCode": 200, "body": "OK"}
+
+    # Guard #2 — off-topic scope filter (allowlist-based, skips LLM entirely)
+    if not is_in_scope(user_message):
+        await telegram.send_message(chat_id, OFF_TOPIC_REPLY)
+        return {"statusCode": 200, "body": "OK"}
+
+    # Guard #4 — per-user rate limit (20 messages / 60 seconds)
+    if await redis.is_rate_limited(telegram_user_id):
+        await telegram.send_message(
+            chat_id,
+            "Too many messages. Please wait a moment before trying again.",
+        )
+        return {"statusCode": 200, "body": "OK"}
+
     # 2. /new  /start  /restart — clear history, no agent invocation
     if is_new_chat_command(body):
         await redis.clear_conversation(telegram_user_id)
 
-        # Cancel any open draft bill
+        # Cancel any open draft bill and any stale PENDING_PAYMENT bills
         try:
             workflow = await mcps.identity.get_workflow_state(telegram_user_id)
             if workflow and workflow.active_draft_bill_id:
                 await mcps.billing.cancel_draft_bill(workflow.active_draft_bill_id)
+            # Also cancel stale PENDING_PAYMENT bills for this store
+            if workflow and workflow.store_id:
+                db = mcps.billing.db
+                pending_resp = (
+                    db.schema("billing")
+                    .table("bills")
+                    .select("id")
+                    .eq("store_id", workflow.store_id)
+                    .eq("status", "PENDING_PAYMENT")
+                    .execute()
+                )
+                for row in (pending_resp.data or []):
+                    try:
+                        await mcps.billing.cancel_bill(bill_id=row["id"])
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -122,6 +193,60 @@ async def async_handler(event: dict, context) -> dict:
         telegram_user_id,
         max_messages=settings.MAX_HISTORY_MESSAGES,
     )
+
+    # 6b. Stale-draft greeting interceptor — bypass LLM entirely
+    # If there is an active draft AND the message is a bare greeting, send the
+    # fixed keyword-menu reply and save it to history so the next turn has
+    # correct context (the model will see its own reply and act accordingly).
+    if is_stale_draft_greeting(user_message, bool(store_context.active_draft_bill_id)):
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await redis.append_messages(
+                telegram_user_id,
+                [
+                    {"role": "user", "content": user_message, "timestamp": now_iso},
+                    {"role": "assistant", "content": STALE_DRAFT_REPLY, "timestamp": now_iso},
+                ],
+            )
+        except Exception as exc:
+            logger.warning("Redis append (stale-draft intercept) failed: %s", exc)
+        await telegram.send_message(chat_id, STALE_DRAFT_REPLY)
+        return {"statusCode": 200, "body": "OK"}
+
+    # 6c. Workflow gate interceptors — bypass LLM for off-track messages
+    # UNREGISTERED: block any billing/product/khata message, redirect to registration.
+    # PENDING_CATALOGUE: block any billing/khata message, redirect to add product.
+    # These are hard code-level gates — no model compliance required.
+    workflow_state = store_context.workflow_state
+    if workflow_state == "UNREGISTERED" and is_unregistered_block(user_message):
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await redis.append_messages(
+                telegram_user_id,
+                [
+                    {"role": "user", "content": user_message, "timestamp": now_iso},
+                    {"role": "assistant", "content": REGISTRATION_GATE_REPLY, "timestamp": now_iso},
+                ],
+            )
+        except Exception as exc:
+            logger.warning("Redis append (registration gate) failed: %s", exc)
+        await telegram.send_message(chat_id, REGISTRATION_GATE_REPLY)
+        return {"statusCode": 200, "body": "OK"}
+
+    if workflow_state == "PENDING_CATALOGUE" and is_pending_catalogue_block(user_message):
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await redis.append_messages(
+                telegram_user_id,
+                [
+                    {"role": "user", "content": user_message, "timestamp": now_iso},
+                    {"role": "assistant", "content": CATALOGUE_GATE_REPLY, "timestamp": now_iso},
+                ],
+            )
+        except Exception as exc:
+            logger.warning("Redis append (catalogue gate) failed: %s", exc)
+        await telegram.send_message(chat_id, CATALOGUE_GATE_REPLY)
+        return {"statusCode": 200, "body": "OK"}
 
     # 7. Run agent
     try:
