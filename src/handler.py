@@ -39,10 +39,14 @@ from src.telegram.update_parser import (
     is_new_chat_command,
 )
 from src.utils.scope_guard import (
+    CATALOGUE_GATE_REPLY,
     OFF_TOPIC_REPLY,
+    REGISTRATION_GATE_REPLY,
     STALE_DRAFT_REPLY,
     is_in_scope,
+    is_pending_catalogue_block,
     is_stale_draft_greeting,
+    is_unregistered_block,
 )
 
 logger = logging.getLogger(__name__)
@@ -123,11 +127,27 @@ async def async_handler(event: dict, context) -> dict:
     if is_new_chat_command(body):
         await redis.clear_conversation(telegram_user_id)
 
-        # Cancel any open draft bill
+        # Cancel any open draft bill and any stale PENDING_PAYMENT bills
         try:
             workflow = await mcps.identity.get_workflow_state(telegram_user_id)
             if workflow and workflow.active_draft_bill_id:
                 await mcps.billing.cancel_draft_bill(workflow.active_draft_bill_id)
+            # Also cancel stale PENDING_PAYMENT bills for this store
+            if workflow and workflow.store_id:
+                db = mcps.billing.db
+                pending_resp = (
+                    db.schema("billing")
+                    .table("bills")
+                    .select("id")
+                    .eq("store_id", workflow.store_id)
+                    .eq("status", "PENDING_PAYMENT")
+                    .execute()
+                )
+                for row in (pending_resp.data or []):
+                    try:
+                        await mcps.billing.cancel_bill(bill_id=row["id"])
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -191,6 +211,41 @@ async def async_handler(event: dict, context) -> dict:
         except Exception as exc:
             logger.warning("Redis append (stale-draft intercept) failed: %s", exc)
         await telegram.send_message(chat_id, STALE_DRAFT_REPLY)
+        return {"statusCode": 200, "body": "OK"}
+
+    # 6c. Workflow gate interceptors — bypass LLM for off-track messages
+    # UNREGISTERED: block any billing/product/khata message, redirect to registration.
+    # PENDING_CATALOGUE: block any billing/khata message, redirect to add product.
+    # These are hard code-level gates — no model compliance required.
+    workflow_state = store_context.workflow_state
+    if workflow_state == "UNREGISTERED" and is_unregistered_block(user_message):
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await redis.append_messages(
+                telegram_user_id,
+                [
+                    {"role": "user", "content": user_message, "timestamp": now_iso},
+                    {"role": "assistant", "content": REGISTRATION_GATE_REPLY, "timestamp": now_iso},
+                ],
+            )
+        except Exception as exc:
+            logger.warning("Redis append (registration gate) failed: %s", exc)
+        await telegram.send_message(chat_id, REGISTRATION_GATE_REPLY)
+        return {"statusCode": 200, "body": "OK"}
+
+    if workflow_state == "PENDING_CATALOGUE" and is_pending_catalogue_block(user_message):
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            await redis.append_messages(
+                telegram_user_id,
+                [
+                    {"role": "user", "content": user_message, "timestamp": now_iso},
+                    {"role": "assistant", "content": CATALOGUE_GATE_REPLY, "timestamp": now_iso},
+                ],
+            )
+        except Exception as exc:
+            logger.warning("Redis append (catalogue gate) failed: %s", exc)
+        await telegram.send_message(chat_id, CATALOGUE_GATE_REPLY)
         return {"statusCode": 200, "body": "OK"}
 
     # 7. Run agent

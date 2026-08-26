@@ -199,6 +199,16 @@ class Settings:
     def LAMBDA_FUNCTION_URL(self) -> str:
         return _optional("LAMBDA_FUNCTION_URL")
 
+    @property
+    def TELEGRAM_TEST_CHAT_ID(self) -> str:
+        """
+        Telegram chat ID used ONLY by run_local.py's /sendtg dev command to
+        validate real MarkdownV2 rendering against the live Telegram API.
+        Empty by default. NEVER read by production code (handler.py always
+        uses the real chat_id from the incoming webhook).
+        """
+        return _optional("TELEGRAM_TEST_CHAT_ID")
+
     # ---- Tuning ----
     @property
     def MAX_HISTORY_MESSAGES(self) -> int:

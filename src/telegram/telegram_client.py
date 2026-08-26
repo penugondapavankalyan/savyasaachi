@@ -80,10 +80,16 @@ def _escape_markdownv2(text: str) -> str:
     """
     Escape *text* for Telegram MarkdownV2 parse mode.
 
-    Protected segments (code, bold, italic, underline, spoiler, links) are
-    emitted verbatim (with **bold** converted to *bold*).  All 18 MarkdownV2
-    special characters in plain-text regions are backslash-escaped, including
-    the backslash itself (always escaped first to avoid double-escaping).
+    Protected segments (code, bold, italic, underline, spoiler, links) keep
+    their delimiters intact (with **bold** converted to *bold*).  Per the
+    Telegram MarkdownV2 spec, reserved characters must be escaped EVERYWHERE
+    except inside code spans/blocks and link URLs — so the interior text of
+    bold/italic/underline/spoiler segments is escaped too (e.g. *72.9* must
+    be sent as *72\\.9* or Telegram rejects the whole message with
+    "can't parse entities"). Code spans/blocks and links are emitted verbatim.
+    All 18 MarkdownV2 special characters in plain-text regions are
+    backslash-escaped, including the backslash itself (escaped first to
+    avoid double-escaping).
     """
     result: list[str] = []
     last = 0
@@ -94,11 +100,24 @@ def _escape_markdownv2(text: str) -> str:
         # Escape the plain-text region before this protected segment
         result.append(_escape_plain(text[last:start]))
 
-        # Emit the protected segment verbatim, converting **bold** → *bold*
         seg = m.group()
-        if seg.startswith("**") and seg.endswith("**"):
-            seg = "*" + seg[2:-2] + "*"
-        result.append(seg)
+        if seg.startswith("```") or (seg.startswith("`") and not seg.startswith("``")):
+            # fenced code block / inline code span — emit verbatim
+            result.append(seg)
+        elif seg.startswith("**") and seg.endswith("**"):
+            # **bold** (v1 style) → *bold* (v2); escape interior text
+            result.append("*" + _escape_plain(seg[2:-2]) + "*")
+        elif seg.startswith("__") and seg.endswith("__"):
+            result.append("__" + _escape_plain(seg[2:-2]) + "__")
+        elif seg.startswith("||") and seg.endswith("||"):
+            result.append("||" + _escape_plain(seg[2:-2]) + "||")
+        elif seg.startswith("*") and seg.endswith("*"):
+            result.append("*" + _escape_plain(seg[1:-1]) + "*")
+        elif seg.startswith("_") and seg.endswith("_"):
+            result.append("_" + _escape_plain(seg[1:-1]) + "_")
+        else:
+            # [text](url) inline link — emit verbatim
+            result.append(seg)
 
         last = end
 
