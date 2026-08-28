@@ -28,20 +28,24 @@ from src.agent.config import StoreContext
 from src.mcp import MCPInstances
 
 # ── New-product copyable template ─────────────────────────────────────────────
-# Appended to search_products "not found" returns so the owner can tap Copy,
-# edit the values, and paste back — works as a code block on Telegram & WhatsApp.
+# Appended to search_products "not found" returns, and used by the system prompt
+# whenever the model asks for new-product details. A numbered list with a FILLED
+# example (not blank fields) so the owner can tap Copy, edit the example values in
+# place, and paste back — a single fenced code block renders as monospace/copyable
+# on Telegram & WhatsApp (a pipe/markdown table does NOT — see system_prompt.py).
 _NEW_PRODUCT_TEMPLATE = (
-    "\n\nHere is a sample format:\n"
+    "\n\nTo add a new product, I need the following details. Here's an example — "
+    "copy this, replace the values with the real ones, and send it back:\n"
     "```\n"
-    "Name: \n"
-    "Type: Branded / Loose\n"
-    "Unit: KG / G / L / ML / PIECE / PACKET / DOZEN / BUNDLE\n"
-    "Cost price (₹): \n"
-    "Selling price / MRP (₹): \n"
-    "GST rate: 0 / 5 / 12 / 18 / 28  (0 for loose, mandatory for branded)\n"
-    "Brand: \n"
-    "Reorder level: \n"
-    "Current stock: \n"
+    "1. Name - Bottle\n"
+    "2. Type - Branded / Loose\n"
+    "3. Unit - PIECE / KG / G / L / ML / PACKET / DOZEN / BUNDLE\n"
+    "4. Cost price (Rs.) - 10\n"
+    "5. Selling price / MRP (Rs.) - 15\n"
+    "6. GST rate - 5  (0 for loose, else 5 / 12 / 18 / 28 for branded)\n"
+    "7. Brand - Company Name (skip if loose)\n"
+    "8. Reorder level - 20\n"
+    "9. Initial stock - 50\n"
     "```"
 )
 
@@ -104,13 +108,22 @@ def _build_unregistered_tools(mcps: MCPInstances, tuid: int) -> list[Callable]:
         default_payment_mode: str = "CASH",
     ) -> str:
         """
-        Create the shop for the owner. Call this once all store details have been collected.
+        Create the shop for the owner. Call this ONLY after:
+        1. The owner has confirmed their name (save_owner_name was called).
+        2. ALL 6 shop details have been collected AND the owner confirmed the summary.
+
+        DO NOT call this tool until the owner explicitly says 'yes' or 'save' to the
+        summary you showed them. NEVER skip the confirmation step.
+
+        Parameters:
         - shop_name: name of the shop (required)
-        - phone: shop phone number — MANDATORY, must be a valid number
+        - phone: shop phone number — MANDATORY, must be a valid 10-digit Indian mobile number
         - state_code: 2-digit Indian GST state code (required, e.g. '29' for Karnataka, '27' for Maharashtra)
         - gstin: 15-character GST registration number (optional — pass None if owner said 'skip')
         - address: shop address (optional — pass None if owner said 'skip')
-        - default_payment_mode: CASH / UPI / CREDIT (default CASH)
+        - default_payment_mode: CASH / UPI / CREDIT.
+          Ask the owner which mode they prefer. If they don't specify, use 'CASH' and inform them:
+          'No payment mode specified — setting Cash as the default. You can change this later.'
         Returns confirmation with store details.
         """
         from src.utils.guardrails import clean_phone
@@ -138,13 +151,41 @@ def _build_unregistered_tools(mcps: MCPInstances, tuid: int) -> list[Callable]:
                 )
             except Exception:
                 pass
-        return result.message
+        return (
+            result.message + "\n\n"
+            "⚠️ MANDATORY NEXT STEP — output EXACTLY the following to the owner, nothing else:\n"
+            "Registration complete! 🎉 Now let's add your first product.\n\n"
+            "Copy the template below, fill in the real values, and send it back:\n"
+            "```\n"
+            "1. Name - \n"
+            "2. Type - Branded / Loose\n"
+            "3. Unit - PIECE / KG / G / L / ML / PACKET / DOZEN / BUNDLE\n"
+            "4. Cost price (Rs.) - \n"
+            "5. Selling price / MRP (Rs.) - \n"
+            "6. GST rate - 5  (0 for loose, else 5 / 12 / 18 / 28 for branded)\n"
+            "7. Brand - Company Name (skip if loose)\n"
+            "8. Reorder level - \n"
+            "9. Initial stock - \n"
+            "```\n"
+            "DO NOT offer billing, analytics, or any other options. "
+            "DO NOT ask what the owner wants to do next. "
+            "Show ONLY the template above and wait for the owner to fill it in."
+        )
 
     async def save_owner_name(first_name: str, last_name: str | None = None) -> str:
         """
-        Save the owner's name. Call this once the owner tells you their name.
-        first_name is required. last_name is optional.
-        Returns a confirmation message.
+        Save the owner's name. Call this ONLY after you have CONFIRMED which part of the name
+        is the first name and which (if given) is the last name.
+
+        RULES BEFORE CALLING:
+        - Ask: 'What is your first name?'
+        - Then ask: 'What is your last name? (type skip if you prefer not to share)'
+        - If the owner gives a single word and it is UNCLEAR whether it is first or last name,
+          ask: 'Is "{word}" your first name or last name?' — NEVER assume.
+        - Only call this tool once you know exactly which field is first_name and which is last_name.
+
+        first_name: required (what the owner confirmed is their first name)
+        last_name: optional (what the owner confirmed is their last name, or None if they skipped)
         """
         from src.mcp.identity.models import RegisterUserResult
         result: RegisterUserResult = await mcps.identity.register_user(
@@ -152,7 +193,8 @@ def _build_unregistered_tools(mcps: MCPInstances, tuid: int) -> list[Callable]:
             first_name=first_name,
             last_name=last_name,
         )
-        return f"Got it! Welcome, {first_name}. Now, what is the name of your shop?"
+        display = f"{first_name} {last_name}".strip() if last_name else first_name
+        return f"Got it! Welcome, {display}. Now let's set up your shop details."
 
     return [save_owner_name, setup_store]
 
@@ -177,8 +219,20 @@ def _build_pending_catalogue_tools(
         hsn_code: str | None = None,
     ) -> str:
         """
-        Add a confirmed product to the catalogue. Only call this AFTER the owner
-        has confirmed the product details (shown summary and said yes).
+        Add a confirmed product to the catalogue. Call this ONLY after:
+        1. The owner has explicitly provided ALL 9 fields (name, type, unit, cost price,
+           MRP, GST rate, brand, reorder level, initial stock).
+        2. You have shown the owner a product summary and they confirmed with 'yes'.
+
+        ⚠️ NEVER assume or guess any field — especially:
+           - is_loose: NEVER assume. Ask 'Is it Loose or Branded/Packaged?'
+           - gst_rate: Loose → always 0. Branded → MUST be exactly 5/12/18/28.
+             If the owner has not stated the GST rate for a branded item → ask.
+           - unit: NEVER assume. Ask explicitly.
+           - brand: NEVER assume. Ask for the brand name if branded.
+        ⚠️ NEVER ask for HSN code — it is not required.
+
+        Parameters:
         - name: product name (e.g. 'Tata Salt', 'Sugar')
         - is_loose: True if sold loose by weight/volume, False if branded/packaged
         - unit: one of KG / G / L / ML / PACKET / PIECE / DOZEN / BUNDLE
@@ -188,7 +242,11 @@ def _build_pending_catalogue_tools(
         - gst_rate: MANDATORY. Loose items → always pass 0. Branded items → MUST be
           one of 5 / 12 / 18 / 28. NEVER pass 0 for branded — ask the owner first.
         - brand: brand name if branded (e.g. 'Tata'), None if loose
-        - hsn_code: HSN code if known, None if not
+
+        ⚠️ SAME-TURN RULE: after calling add_product(), you MUST call receive_stock() in
+        the SAME turn using the initial stock quantity the owner provided.
+        Do NOT skip receive_stock() — without stock, billing will not work.
+        The product_id is saved server-side; receive_stock() resolves it automatically.
         """
         from src.mcp.catalogue.models import AddProductResult
         try:
@@ -205,7 +263,11 @@ def _build_pending_catalogue_tools(
                 gst_rate=gst_rate,
                 telegram_user_id=tuid,
             )
-            return result.message
+            return (
+                result.message
+                + f"\n[internal product_id={result.product_id} — use for receive_stock(), do NOT show to owner]"
+                + "\n⚠️ MANDATORY NEXT STEP (same turn): call receive_stock(product_id, initial_stock_qty) NOW."
+            )
         except Exception as e:
             return f"ERROR: {e}"
 
@@ -329,7 +391,28 @@ def _build_pending_catalogue_tools(
         )
         return result.message
 
-    return [add_product, list_products, search_products, update_product_details, update_store, update_owner_name]
+    async def receive_stock(product_id: str, quantity: float, notes: str | None = None) -> str:
+        """
+        Record initial stock for a newly added product.
+        MUST be called in the SAME turn as add_product() — do NOT skip.
+        - product_id: the product_id returned by add_product() (from [internal product_id=...])
+        - quantity: the initial stock quantity the owner specified (REQUIRED)
+        The store will transition to ACTIVE once stock is received.
+        """
+        from src.mcp.inventory.models import ReceiveStockResult
+        try:
+            result: ReceiveStockResult = await mcps.inventory.receive_stock(
+                store_id=store_id,
+                product_id=product_id,
+                quantity=quantity,
+                notes=notes,
+                telegram_user_id=tuid,
+            )
+            return result.message
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    return [add_product, receive_stock, list_products, search_products, update_product_details, update_store, update_owner_name]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -416,22 +499,25 @@ def _build_pending_inventory_tools(
         """
         Add a new product to the catalogue.
 
-        ⚠️ STOP — before calling this tool you MUST have ALL of the following from the owner.
-        Ask for anything not yet provided — ONE question covering all missing fields:
-          • Is it LOOSE (sold by weight/volume, e.g. rice, oil) or BRANDED/PACKAGED (e.g. Parle-G, Tata Salt)?
-            NEVER assume — always ask explicitly.
-          • Unit: KG / G / L / ML / PIECE / PACKET / DOZEN / BUNDLE
-          • Cost price (what the shop paid per unit, in ₹)
-          • MRP / selling price per unit (in ₹)
-          • GST rate: LOOSE items → always 0. BRANDED items → MUST be exactly 5 / 12 / 18 / 28 — NEVER guess, NEVER use 0 for branded.
-          • Reorder level (minimum stock quantity before alert)
-          • Brand name if branded (e.g. "Parry's", "Tata") — pass None for loose items
-          • Initial stock quantity (how many units the shop has right now)
-
-        NEVER invent or assume is_loose, gst_rate, brand, or any other field.
-        NEVER ask for description, category, or any field not listed above — they do not exist.
-        ⚠️ SAME TURN RULE: once you have ALL fields including initial stock quantity,
-        call add_product() AND receive_stock() in the SAME turn — do NOT split across turns.
+        ⚠️ STOP — before calling this tool you MUST collect ALL 9 fields from the owner
+        using the copyable fenced code block template below.
+        DO NOT use a plain bullet list or numbered prose — use ONLY the ``` code block.
+        Pre-fill the product name the owner mentioned. Example:
+        ```
+        1. Name - Salt
+        2. Type - Branded / Loose
+        3. Unit - PIECE / KG / G / L / ML / PACKET / DOZEN / BUNDLE
+        4. Cost price (Rs.) - 10
+        5. Selling price / MRP (Rs.) - 15
+        6. GST rate - 5  (0 for loose, else 5 / 12 / 18 / 28 for branded)
+        7. Brand - Company Name (skip if loose)
+        8. Reorder level - 20
+        9. Initial stock - 50
+        ```
+        NEVER assume is_loose, gst_rate, brand, or unit.
+        NEVER ask for description, category, or HSN code.
+        ⚠️ SAME TURN RULE: once you have ALL 9 fields, call add_product() AND receive_stock()
+        in the SAME turn — do NOT split across turns.
         The product_id is saved server-side — receive_stock() resolves it automatically.
         """
         from src.mcp.catalogue.models import AddProductResult
@@ -583,14 +669,17 @@ def _build_active_tools(
         Search for a product by name. Returns full product_id and details.
 
         QUERY RULES:
+        - Use the SHORTEST single word that identifies the product — never multi-word.
+          CORRECT:   search_products(query='wheat')   or   search_products(query='aata')
+          INCORRECT: search_products(query='wheat aata')  ← multi-word misses results
+          If owner says 'wheat aata', search for 'wheat' (the most distinctive word).
         - ALWAYS use the SINGULAR base form — never plural.
           CORRECT:   search_products(query='pencil')
           INCORRECT: search_products(query='pencils')  ← plural misses results
-          If owner says 'natraj pencils', search for 'pencil' not 'pencils'.
-        - Search by product name ONLY — never include brand in query.
+        - Search by product name ONLY — never use brand as the query.
           CORRECT:   search_products(query='pencil')
-          INCORRECT: search_products(query='natraj pencil')  ← brand belongs in brand field
-          If owner says 'natraj pencils', search for 'pencil' — the DB finds brand automatically.
+          INCORRECT: search_products(query='natraj')  ← brand alone misses results
+          If owner says 'natraj pencils', search for 'pencil' — results include brand info.
         - If this tool already returned results earlier this turn or the previous turn,
           do NOT call it again — use the product_id already in your context.
         - If the owner disambiguates from a prior multi-result response (e.g. says 'natraj'
@@ -645,6 +734,73 @@ def _build_active_tools(
             )
         return "\n".join(lines)
 
+    async def update_store(
+        shop_name: str | None = None, phone: str | None = None,
+        address: str | None = None, state_code: str | None = None,
+        default_payment_mode: str | None = None,
+    ) -> str:
+        """Update store-level details. Only pass fields that need to change — leave others as None.
+
+        USE WHEN owner says things like:
+          - 'always assume cash' / 'default payment is cash' / 'always use UPI'
+            → update_store(default_payment_mode='CASH') or 'UPI' or 'CREDIT'
+          - 'change shop name to X' → update_store(shop_name='X')
+          - 'update phone to 9999988888' → update_store(phone='9999988888')
+          - 'change address to ...' → update_store(address='...')
+
+        ⚠️ When owner says 'always assume cash/upi/credit' or 'default payment is X',
+        MANDATORY: call update_store(default_payment_mode='CASH'/'UPI'/'CREDIT') immediately.
+        DO NOT just acknowledge in text — always call this tool so the DB is updated.
+        valid values for default_payment_mode: 'CASH', 'UPI', 'CREDIT'
+        """
+        try:
+            result = await mcps.identity.update_store(
+                store_id=store_id, shop_name=shop_name, phone=phone,
+                address=address, state_code=state_code,
+                default_payment_mode=default_payment_mode,
+            )
+            return f"Store updated: {result.shop_name} | Phone: {result.phone or 'not set'} | State: {result.state_code}"
+        except Exception as e:
+            return f"ERROR: {e}"
+
+    async def update_owner_name(first_name: str | None = None, last_name: str | None = None) -> str:
+        """Update the owner's name on their profile."""
+        result = await mcps.identity.update_user(
+            telegram_user_id=tuid, first_name=first_name, last_name=last_name
+        )
+        return result.message
+
+    async def get_store_details() -> str:
+        """
+        Fetch the store's real profile details from the database.
+
+        USE WHEN: owner asks 'store details', 'shop details', 'my store info',
+        'what is my shop address', 'store phone number', 'what is my GSTIN', etc.
+
+        ⚠️ CRITICAL: This tool returns ONLY the fields this system actually tracks.
+        Fields it does NOT track — email address, bank account/IFSC/UPI details,
+        business hours, product category lists — are NOT available. If the owner
+        asks for any of those, say EXACTLY: 'I don't have that information.'
+        NEVER invent a value for ANY field, known or unknown.
+        """
+        try:
+            store = await mcps.identity.get_store(telegram_user_id=tuid)
+        except Exception as e:
+            return f"ERROR: {e}"
+        if not store:
+            return "No store found. Store setup may not be complete."
+        return (
+            f"Shop Name: {store.shop_name}\n"
+            f"Phone: {store.phone or 'not set'}\n"
+            f"Address: {store.address or 'not set'}\n"
+            f"State code: {store.state_code}\n"
+            f"GSTIN: {store.gstin or 'not registered'}\n"
+            f"Default payment mode: {store.default_payment_mode}\n"
+            f"⚠️ These are the ONLY store fields available. Do NOT state or invent "
+            f"email, bank/UPI account details, business hours, or anything not listed above — "
+            f"say 'I don't have that information' instead."
+        )
+
     async def get_payment_history(name_or_phone: str) -> str:
         """
         Get full payment and billing history for a customer.
@@ -658,9 +814,12 @@ def _build_active_tools(
 
         Returns all payments and bills sorted newest first, plus current outstanding balance.
         """
-        lookup = await mcps.khata.get_customer(
-            store_id=store_id, name_or_phone=name_or_phone
-        )
+        for _variant in _possessive_variants(name_or_phone):
+            lookup = await mcps.khata.get_customer(
+                store_id=store_id, name_or_phone=_variant
+            )
+            if lookup.found:
+                break
         if not lookup.found:
             return f"No customer found matching '{name_or_phone}'."
         if len(lookup.customers) > 1:
@@ -798,9 +957,12 @@ def _build_active_tools(
         Returns bill number, date, total, payment mode for each bill, plus current khata balance.
         For full payment rows use get_payment_history instead.
         """
-        lookup = await mcps.khata.get_customer(
-            store_id=store_id, name_or_phone=name_or_phone
-        )
+        for _variant in _possessive_variants(name_or_phone):
+            lookup = await mcps.khata.get_customer(
+                store_id=store_id, name_or_phone=_variant
+            )
+            if lookup.found:
+                break
         if not lookup.found:
             return f"No customer found matching '{name_or_phone}'."
         if len(lookup.customers) > 1:
@@ -882,11 +1044,11 @@ def _build_active_tools(
         result = await mcps.khata.list_customers_with_balances(store_id=store_id)
         if not result:
             return "No customers found."
-        lines = ["| Name | Phone | Balance | Owes | customer_id |",
-                 "|------|-------|---------|------|-------------|"]
-        for c in result:
+        lines = ["Customers with balances "
+                  "[internal — customer_ids below are for tool calls only, NEVER show to owner]:"]
+        for i, c in enumerate(result, 1):
             bal, owes = _balance_cols(c.balance)
-            lines.append(f"| {c.name} | {c.phone} | {bal} | {owes} | {c.customer_id} |")
+            lines.append(f"  {i}. [internal customer_id={c.customer_id}] {c.name} ({c.phone}) — {bal} ({owes})")
         return "\n".join(lines)
 
     # ── CATALOGUE intent ─────────────────────────────────────────────────
@@ -897,7 +1059,27 @@ def _build_active_tools(
             mrp: float, reorder_level: float, brand: str | None = None,
             hsn_code: str | None = None, gst_rate: float = 0.0,
         ) -> str:
-            """Add a new product to the catalogue after owner confirmation."""
+            """
+            Add a new product to the catalogue after owner confirmation.
+
+            ⚠️ STOP — before calling this tool you MUST collect ALL 9 fields from the owner
+            using the copyable fenced code block template (see Rule 24).
+            DO NOT use a plain bullet or numbered list — use the ``` code block template ONLY.
+            Pre-fill the product name the owner mentioned. Example:
+            ```
+            1. Name - Salt
+            2. Type - Branded / Loose
+            3. Unit - PIECE / KG / G / L / ML / PACKET / DOZEN / BUNDLE
+            4. Cost price (Rs.) - 10
+            5. Selling price / MRP (Rs.) - 15
+            6. GST rate - 5  (0 for loose, else 5 / 12 / 18 / 28 for branded)
+            7. Brand - Company Name (skip if loose)
+            8. Reorder level - 20
+            9. Initial stock - 50
+            ```
+            NEVER assume is_loose, gst_rate, brand, or unit.
+            Only call this tool after the owner confirms the summary with 'yes'.
+            """
             from src.mcp.catalogue.models import AddProductResult
             try:
                 result: AddProductResult = await mcps.catalogue.add_product(
@@ -967,29 +1149,6 @@ def _build_active_tools(
             )
             return result.message
 
-        async def update_store(
-            shop_name: str | None = None, phone: str | None = None,
-            address: str | None = None, state_code: str | None = None,
-            default_payment_mode: str | None = None,
-        ) -> str:
-            """Update store details. Only pass fields that should change."""
-            try:
-                result = await mcps.identity.update_store(
-                    store_id=store_id, shop_name=shop_name, phone=phone,
-                    address=address, state_code=state_code,
-                    default_payment_mode=default_payment_mode,
-                )
-                return f"Store updated: {result.shop_name} | Phone: {result.phone or 'not set'} | State: {result.state_code}"
-            except Exception as e:
-                return f"ERROR: {e}"
-
-        async def update_owner_name(first_name: str | None = None, last_name: str | None = None) -> str:
-            """Update the owner's name on their profile."""
-            result = await mcps.identity.update_user(
-                telegram_user_id=tuid, first_name=first_name, last_name=last_name
-            )
-            return result.message
-
         async def check_availability(product_id: str, quantity: float) -> str:
             """
             Check if a product has enough stock for a sale.
@@ -1039,7 +1198,7 @@ def _build_active_tools(
             return str(result)
 
         return [search_products, list_products, add_product, receive_stock, update_product_details,
-                deactivate_product, update_store, update_owner_name,
+                deactivate_product, update_store, update_owner_name, get_store_details,
                 check_availability, add_item_to_draft]
 
     # ── INVENTORY intent ─────────────────────────────────────────────────
@@ -1055,7 +1214,16 @@ def _build_active_tools(
             return result.message
 
         async def get_stock(product_id: str) -> str:
-            """Get current stock level for a product."""
+            """
+            Get current stock level for a product.
+            product_id MUST be a full UUID from search_products or list_products — never invent one.
+            """
+            from src.utils.guardrails import clean_uuid
+            if not clean_uuid(product_id):
+                return (
+                    f"ERROR: '{product_id}' is not a valid product_id. "
+                    "Call search_products(query='<name>') first to get the real UUID."
+                )
             result = await mcps.inventory.get_stock(
                 store_id=store_id, product_id=product_id
             )
@@ -1067,14 +1235,33 @@ def _build_active_tools(
             return str(result)
 
         async def check_availability(product_id: str, quantity: float) -> str:
-            """Check if enough stock is available for a sale."""
+            """
+            Check if enough stock is available for a sale.
+            product_id MUST be a full UUID from search_products or list_products — never invent one.
+            """
+            from src.utils.guardrails import clean_uuid
+            if not clean_uuid(product_id):
+                return (
+                    f"ERROR: '{product_id}' is not a valid product_id. "
+                    "Call search_products(query='<name>') first to get the real UUID."
+                )
             result = await mcps.inventory.check_availability(
                 store_id=store_id, product_id=product_id, requested_quantity=quantity
             )
             return str(result)
 
         async def get_low_stock_items() -> str:
-            """Get all items that are at or below their reorder level."""
+            """
+            Get all items that are at or below THEIR OWN reorder level (per-product,
+            stored in the catalogue — never a generic number).
+
+            ⚠️ MANDATORY: call this tool whenever the owner asks 'what's running out',
+            'what's running low', 'what needs reordering', 'low stock', 'out of stock',
+            or similar. This is a REAL tool call — NEVER answer from memory or with a
+            guessed/invented threshold like '30 units' or 'items below 20'.
+            Each product has its own reorder_level set when it was added to the
+            catalogue — only this tool knows the correct per-product values.
+            """
             result = await mcps.inventory.get_low_stock_items(store_id=store_id)
             return str(result)
 
@@ -1121,9 +1308,12 @@ def _build_active_tools(
 
         async def get_customer(name_or_phone: str) -> str:
             """Look up a customer by name or phone number."""
-            result = await mcps.khata.get_customer(
-                store_id=store_id, name_or_phone=name_or_phone
-            )
+            for _variant in _possessive_variants(name_or_phone):
+                result = await mcps.khata.get_customer(
+                    store_id=store_id, name_or_phone=_variant
+                )
+                if result.found:
+                    break
             if not result.found:
                 return f"No customer found matching '{name_or_phone}'."
             if len(result.customers) == 1:
@@ -1134,13 +1324,12 @@ def _build_active_tools(
                     f"balance={bal} | owes={owes}"
                 )
             lines = [
-                f"Multiple customers found for '{name_or_phone}':",
-                "| Name | Phone | Balance | Owes | customer_id |",
-                "|------|-------|---------|------|-------------|",
+                f"Multiple customers found for '{name_or_phone}' "
+                f"[internal — customer_ids below are for tool calls only, NEVER show to owner]:",
             ]
-            for c in result.customers:
+            for i, c in enumerate(result.customers, 1):
                 bal, owes = _balance_cols(c.current_balance)
-                lines.append(f"| {c.name} | {c.phone} | {bal} | {owes} | {c.customer_id} |")
+                lines.append(f"  {i}. [internal customer_id={c.customer_id}] {c.name} ({c.phone}) — {bal} ({owes})")
             return "\n".join(lines)
 
         async def add_credit_entry(customer_id: str, amount: float, notes: str | None = None) -> str:
@@ -1339,15 +1528,43 @@ def _build_active_tools(
     if intent == "ANALYTICS":
         async def get_daily_summary(date_str: str | None = None) -> str:
             """
-            Get daily sales summary.
+            Get daily sales summary for a specific date.
             - date_str: YYYY-MM-DD (default: today)
+            Call this for ANY request about sales overview, today's sales, daily report,
+            how much was sold, revenue for a day, or any daily summary question.
+            ALWAYS report the EXACT numbers returned — NEVER re-compute or re-add GST.
             """
             from src.utils.ist import today_ist as _today_ist
             target = date_str or _today_ist().isoformat()
             result = await mcps.analytics.get_daily_summary(
                 store_id=store_id, summary_date=target
             )
-            return str(result)
+            # Build a clear, unambiguous string so the model cannot misread raw Pydantic repr
+            top = ""
+            if result.top_items:
+                top_lines = []
+                for i, it in enumerate(result.top_items[:5], 1):
+                    top_lines.append(
+                        f"  {i}. {it.product_name}"
+                        + (f" ({it.brand})" if it.brand else "")
+                        + f" — {it.quantity_sold} {it.unit} — ₹{it.revenue:.2f}"
+                    )
+                top = "\nTop items:\n" + "\n".join(top_lines)
+            status = "CLOSED" if result.is_day_closed else "LIVE"
+            return (
+                f"Daily Summary for {result.summary_date} [{status}]\n"
+                f"Bills: {result.bill_count}\n"
+                f"Total sales (incl. GST): ₹{result.total_sales:.2f}\n"
+                f"  CGST collected: ₹{result.total_cgst:.2f}\n"
+                f"  SGST collected: ₹{result.total_sgst:.2f}\n"
+                f"  Total tax: ₹{result.total_tax:.2f}\n"
+                f"Payment breakdown:\n"
+                f"  Cash: ₹{result.cash_sales:.2f}\n"
+                f"  UPI: ₹{result.upi_sales:.2f}\n"
+                f"  Credit (khata): ₹{result.credit_sales:.2f}\n"
+                f"  Card: ₹{result.card_sales:.2f}"
+                + top
+            )
 
         async def get_sales_trend(
             start_date: str | None = None,
@@ -1410,7 +1627,16 @@ def _build_active_tools(
             return str(result)
 
         async def get_low_stock_items() -> str:
-            """Get items at or below reorder level."""
+            """
+            Get all items that are at or below THEIR OWN reorder level (per-product,
+            stored in the catalogue — never a generic number).
+
+            ⚠️ MANDATORY: call this tool whenever the owner asks 'what's running out',
+            'what's running low', 'what needs reordering', 'low stock', 'out of stock',
+            or similar. NEVER answer from memory or with a guessed/invented threshold
+            like '30 units' — each product has its own reorder_level in the catalogue;
+            only this tool knows the correct per-product values.
+            """
             result = await mcps.inventory.get_low_stock_items(store_id=store_id)
             return str(result)
 
@@ -1493,6 +1719,30 @@ def _build_active_tools(
                 f"To see current items and total, call get_draft_bill().\n"
                 f"To proceed to checkout, call get_draft_bill() then finalize_and_pay() or finalize_bill()."
             )
+
+        # Safety net: if a PENDING_PAYMENT bill from this session is still open,
+        # auto-cancel it before creating a new draft.  This can happen when the
+        # model bypasses amend_pending_bill and tries to manually rebuild the bill
+        # instead of using the atomic amend flow.
+        if _bill_id_cell[0]:
+            stale_bill_id = _bill_id_cell[0]
+            try:
+                cancel_resp = await mcps.billing.cancel_bill(bill_id=stale_bill_id)
+                _bill_id_cell[0] = None
+                # Log the auto-cancel but don't surface the bill_id to the model
+                import logging as _logging
+                _logging.getLogger("kirana.tool_audit").info(
+                    "[AUTO-CANCEL] Stale PENDING_PAYMENT bill %s cancelled before new draft "
+                    "(reason: bill item changes requested after finalize). "
+                    "cancel_result=%s", stale_bill_id, cancel_resp.message
+                )
+            except Exception as _e:
+                import logging as _logging
+                _logging.getLogger("kirana.tool_audit").warning(
+                    "[AUTO-CANCEL] Failed to cancel stale bill %s: %s", stale_bill_id, _e
+                )
+                # Continue — allow new draft creation even if cancel failed
+                _bill_id_cell[0] = None
         result = await mcps.billing.create_draft_bill(
             store_id=store_id, telegram_user_id=tuid
         )
@@ -1500,10 +1750,12 @@ def _build_active_tools(
         # within this same request, even though they were captured before the draft existed.
         _draft_id_cell[0] = result.draft_bill_id
         return (
-            f"✅ New bill started.\n"
+            f"✅ Draft bill started.\n"
             f"[internal draft_bill_id={result.draft_bill_id} — DO NOT show to owner]\n"
-            f"status={result.status} | items={result.item_count} | total=₹{result.estimated_total:.2f}\n"
-            f"Ask the owner: 'What items would you like to add?'"
+            f"status={result.status} | items=0 | total=₹0.00\n"
+            f"⚠️ NEXT STEP: Call add_item_to_draft() NOW for every item the owner already mentioned.\n"
+            f"Do NOT ask the owner what to add — they already told you. Add all items immediately.\n"
+            f"Only ask 'Would you like to add anything else?' AFTER all mentioned items are added."
         )
 
     async def add_item_to_draft(product_id: str, quantity: float) -> str:
@@ -1552,9 +1804,10 @@ def _build_active_tools(
             return f"ERROR: {msg}"
         return (
             str(result) + "\n"
-            "Ask: 'Would you like to add anything else?'\n"
-            "Only ask about payment method when the owner says they are done "
-            "(e.g. 'done', 'that's all', 'proceed', 'checkout', 'finalize')."
+            "⚠️ If there are MORE items from the owner's original message that have NOT been added yet, "
+            "call add_item_to_draft() for the next item NOW — do NOT pause to ask.\n"
+            "Only ask 'Would you like to add anything else?' AFTER every item from the owner's message "
+            "has been added. Never ask mid-list."
         )
 
     async def remove_item_from_draft(product_id: str) -> str:
@@ -1631,6 +1884,12 @@ def _build_active_tools(
         """Get the current contents and GST-inclusive total of the active bill draft.
         Do NOT pass draft_bill_id — resolved automatically.
 
+        USE WHEN owner asks ANY of:
+          'list bill items', 'show bill', 'show items', 'list items',
+          'what is in the bill', 'bill details', 'what did I add',
+          'show current bill', 'view bill', 'current bill'
+        ALWAYS call this tool — DO NOT answer from memory or show a hallucinated table.
+
         MANDATORY before Stage 2 (payment mode): call this tool to get the accurate
         total_amount (with GST). NEVER quote a total from memory or conversation history
         — always call this tool so the owner sees the correct amount before paying.
@@ -1701,8 +1960,10 @@ def _build_active_tools(
                 f"status=CONFIRMED\n"
                 f"total=₹{result.total_amount:.2f} | payment_mode=CREDIT\n"
                 f"{result.message}\n"
-                f"✅ Bill is CONFIRMED. Do NOT call confirm_payment(). The khata entry has been recorded. "
-                f"Inform the owner and ask if they need anything else."
+                f"✅ Bill CONFIRMED. Khata entry recorded. Do NOT call confirm_payment().\n"
+                f"⚠️ STOP — do NOT offer to add more items. The bill is CLOSED.\n"
+                f"Offer post-bill options ONLY: generate invoice PDF | view today's bills | "
+                f"check inventory | check customer balance | start a new bill."
             )
         return (
             f"bill_number={result.bill_number}\n"
@@ -1805,7 +2066,9 @@ def _build_active_tools(
                     return (
                         f"✅ Payment confirmed! Bill {bill_num} paid in full.\n"
                         f"paid=₹{paid_amount:.2f} | total=₹{bill_total:.2f} | EXACT{customer_note}\n"
-                        f"⚠️ STOP. Do NOT call any other tool. Inform the owner and ask what's next."
+                        f"⚠️ STOP. Do NOT call any other tool. Do NOT offer to add more items — bill is CLOSED.\n"
+                        f"Offer post-bill options ONLY: generate invoice PDF | view today's bills | "
+                        f"check inventory | check customer balance | start a new bill."
                     )
                 elif diff > 0:
                     change_amount = diff
@@ -1862,11 +2125,19 @@ def _build_active_tools(
             return "ERROR: No active draft bill found. Call create_draft_bill() first."
 
         # Step 1 — finalize (always)
-        result = await mcps.billing.finalize_bill(
-            draft_bill_id=resolved_id,
-            payment_mode=payment_mode,
-            telegram_user_id=tuid,
-        )
+        try:
+            result = await mcps.billing.finalize_bill(
+                draft_bill_id=resolved_id,
+                payment_mode=payment_mode,
+                telegram_user_id=tuid,
+            )
+        except ValueError as _ve:
+            # Most common cause: bill is empty (no items added yet)
+            return (
+                f"ERROR: {_ve}\n"
+                f"⚠️ You must call add_item_to_draft() for each item BEFORE calling finalize_and_pay.\n"
+                f"The draft bill exists but has NO items — add items first, then finalize."
+            )
         bill_id    = result.bill_id
         bill_total = result.total_amount
         bill_num   = result.bill_number
@@ -1941,7 +2212,9 @@ def _build_active_tools(
             return (
                 f"bill_number={bill_num} | total=₹{bill_total:.2f} | paid=₹{paid_amount:.2f}\n"
                 f"✅ CONFIRMED. Exact payment received. Bill settled.{customer_note}\n"
-                f"⚠️ STOP. Do NOT call any other tool. Inform the owner and ask what's next."
+                f"⚠️ STOP. Do NOT call any other tool. Do NOT offer to add more items — bill is CLOSED.\n"
+                f"Offer post-bill options ONLY: generate invoice PDF | view today's bills | "
+                f"check inventory | check customer balance | start a new bill."
             )
         elif diff > 0:
             # OVERPAYMENT — store delta in Redis, payment row inserted in resolution turn
@@ -2023,12 +2296,24 @@ def _build_active_tools(
         result = await mcps.billing.cancel_draft_bill(draft_bill_id=resolved_id)
         return str(result)
 
-    async def get_bill(bill_id: str) -> str:
-        """Get details of a finalized bill."""
+    async def get_bill(bill_id: str | None = None) -> str:
+        """Get details of the current PENDING_PAYMENT bill or any confirmed bill.
+
+        USE WHEN owner asks 'list bill items', 'show bill', 'show items', 'bill details',
+        'what is on the bill', 'view bill', 'current bill' — AND no draft is open
+        (i.e. finalize_and_pay has already been called).
+        ALWAYS call this tool — NEVER show bill items from memory or hallucinate a table.
+
+        bill_id is OPTIONAL — omit it (pass null) to show the current PENDING_PAYMENT bill.
+        Only pass bill_id if you have a specific UUID for a different bill.
+        """
+        resolved = bill_id or _bill_id_cell[0]
+        if not resolved:
+            return "ERROR: No current bill found. Please finalize a bill first."
         from src.utils.guardrails import clean_uuid
-        if not clean_uuid(bill_id):
-            return f"ERROR: '{bill_id}' is not a valid bill_id."
-        result = await mcps.billing.get_bill(bill_id=bill_id)
+        if not clean_uuid(resolved):
+            return f"ERROR: '{resolved}' is not a valid bill_id."
+        result = await mcps.billing.get_bill(bill_id=resolved)
         return str(result)
 
     async def collect_balance_now() -> str:
@@ -2129,7 +2414,9 @@ def _build_active_tools(
             return (
                 f"✅ Balance collected. Bill {bill_num} fully settled.\n"
                 f"Total = ₹{bill_total:.2f} | Received in two parts: ₹{paid:.2f} + ₹{bill_total - paid:.2f}\n"
-                f"⚠️ STOP. Do NOT call any other tool. Inform the owner and ask what's next."
+                f"⚠️ STOP. Do NOT call any other tool. Do NOT offer to add more items — bill is CLOSED.\n"
+                f"Offer post-bill options ONLY: generate invoice PDF | view today's bills | "
+                f"check inventory | check customer balance | start a new bill."
             )
         else:  # OVERPAYMENT — change returned as cash
             change = float(intent["delta_amount"])
@@ -2153,7 +2440,9 @@ def _build_active_tools(
             return (
                 f"✅ Change returned. Bill {bill_num} settled.\n"
                 f"Total = ₹{bill_total:.2f} | Paid = ₹{paid:.2f} | Change returned = ₹{change:.2f}\n"
-                f"⚠️ STOP. Do NOT call any other tool. Inform the owner and ask what's next."
+                f"⚠️ STOP. Do NOT call any other tool. Do NOT offer to add more items — bill is CLOSED.\n"
+                f"Offer post-bill options ONLY: generate invoice PDF | view today's bills | "
+                f"check inventory | check customer balance | start a new bill."
             )
 
     async def confirm_payment(paid_amount: float, customer_name: str | None = None) -> str:
@@ -2168,12 +2457,21 @@ def _build_active_tools(
         without calling confirm_payment first.
         ══════════════════════════════════════════════════════════════
 
+        BARE NUMBER RULE — CRITICAL:
+        If the previous assistant message asked 'How much did the customer pay?'
+        or stated the bill total, and the owner replies with ONLY a number
+        (e.g. '600', '562', '1000'), that number IS the paid_amount.
+        Call this tool IMMEDIATELY: confirm_payment(paid_amount=<that number>).
+        DO NOT ask for clarification. DO NOT ask about Sugar or any product.
+        DO NOT hallucinate. The bill is already finalized — just confirm payment.
+
         WHEN TO CALL — any of these patterns:
+          - '600'  or  '562.24'   ← bare number after asking for payment amount
           - 'paid 500'
-          - 'naveen paid 40'       ← name + amount → call confirm_payment(paid_amount=40, customer_name='naveen')
+          - 'naveen paid 40'      ← name + amount → confirm_payment(paid_amount=40, customer_name='naveen')
           - 'customer gave 200'
           - '3949 cash'
-          - 'full amount'          ← only if a specific number was stated earlier this turn; else ask
+          - 'full amount'         ← only if a specific number was stated earlier this turn; else ask
 
         PARAMETERS:
           - paid_amount: REQUIRED — exact rupee amount the customer physically handed over.
@@ -2315,7 +2613,9 @@ def _build_active_tools(
             return (
                 f"✅ Payment confirmed! Bill {bill_num} paid in full.\n"
                 f"paid=₹{paid_amount:.2f} | total=₹{bill_total:.2f} | EXACT{customer_note}\n"
-                f"⚠️ STOP. Do NOT call any other tool. Inform the owner and ask what's next."
+                f"⚠️ STOP. Do NOT call any other tool. Do NOT offer to add more items — bill is CLOSED.\n"
+                f"Offer post-bill options ONLY: generate invoice PDF | view today's bills | "
+                f"check inventory | check customer balance | start a new bill."
             )
 
         elif diff > 0:
@@ -2522,6 +2822,163 @@ def _build_active_tools(
             f"⚠️ STOP — wait for the owner to state the paid amount, then call confirm_payment()."
         )
 
+    async def amend_pending_bill(
+        remove_product_names: list[str] | None = None,
+        add_items: list[dict] | None = None,
+    ) -> str:
+        """
+        ⚠️ ONE-SHOT ATOMIC AMEND — call this as your FIRST AND ONLY tool when the owner changes
+        items on a PENDING_PAYMENT bill (i.e. after finalize_and_pay, before confirm_payment).
+
+        DO NOT call search_products, create_draft_bill, add_item_to_draft, or finalize_and_pay
+        before or after this tool. This tool handles EVERYTHING internally:
+          1. Loads all existing bill items automatically (you do NOT need to look them up).
+          2. Cancels the current PENDING_PAYMENT bill.
+          3. Creates a new draft, re-adds all kept items at original quantities.
+          4. Adds new items by searching the catalogue by name internally.
+          5. Finalizes with the same payment mode → returns a new PENDING_PAYMENT bill total.
+
+        USE WHEN owner says things like:
+          - 'drop amul' / 'remove sugar' / 'take off salt' → remove_product_names=["amul"]
+          - 'add salt 1 kg' / 'include 2 rice' → add_items=[{"product_name":"salt","quantity":1}]
+          - 'drop sugar, add salt' → remove_product_names=["sugar"], add_items=[{"product_name":"salt","quantity":1}]
+          - 'drop amul and add sugar' / 'replace aata with rice' → both params combined
+
+        CRITICAL: The items that are NOT changed (e.g. rice, amul butter) are re-added automatically
+        from the existing bill — you do NOT need to search for them or pass them again.
+
+        Parameters:
+          remove_product_names: list of product name strings to drop (case-insensitive substring match).
+            e.g. ["sugar", "amul"] — only the items to REMOVE. Omit or pass [] if nothing removed.
+          add_items: list of dicts for NEW items to add, each with:
+            - "product_name": str  (tool searches catalogue by this name)
+            - "quantity": float
+            e.g. [{"product_name": "salt", "quantity": 1}]
+            Omit or pass [] if nothing is being added.
+
+        After this tool returns successfully, ask: 'Updated bill total is ₹X.XX. How much did the customer pay?'
+        Then call confirm_payment(paid_amount=...) as normal.
+        DO NOT call finalize_and_pay or create_draft_bill after this tool.
+        DO NOT use this after confirm_payment has already been called.
+        """
+        resolved_bill_id = _bill_id_cell[0]
+        if not resolved_bill_id:
+            return (
+                "ERROR: No PENDING_PAYMENT bill found to amend. "
+                "If a draft is still open, use add_item_to_draft / remove_item_from_draft instead."
+            )
+
+        # Normalise inputs
+        remove_lower = [n.lower().strip() for n in (remove_product_names or [])]
+        adds = add_items or []
+
+        # ── 1. Load current bill details ────────────────────────────────────
+        bill_row = await mcps.billing.get_bill_for_payment(resolved_bill_id)
+        if not bill_row:
+            return f"ERROR: Could not load bill {resolved_bill_id}."
+        if bill_row.get("status") != "PENDING_PAYMENT":
+            return (
+                f"ERROR: Bill is in status '{bill_row.get('status')}' — "
+                "amend_pending_bill only works on PENDING_PAYMENT bills. "
+                "If already confirmed, use void_bill() to reverse, then create a new bill."
+            )
+        original_payment_mode = bill_row.get("payment_mode", "CASH")
+
+        # ── 2. Load bill items ───────────────────────────────────────────────
+        existing_items = await mcps.billing._get_bill_items(resolved_bill_id)
+        if not existing_items:
+            return "ERROR: No items found on the existing bill."
+
+        # ── 3. Cancel the PENDING_PAYMENT bill (restores stock) ─────────────
+        cancel_result = await mcps.billing.cancel_bill(bill_id=resolved_bill_id)
+        if not cancel_result.success:
+            return f"ERROR: Could not cancel the existing bill: {cancel_result.message}"
+        _bill_id_cell[0] = None
+
+        # ── 4. Create a new draft ────────────────────────────────────────────
+        new_draft = await mcps.billing.create_draft_bill(
+            store_id=store_id, telegram_user_id=tuid
+        )
+        new_draft_id = new_draft.draft_bill_id
+        _draft_id_cell[0] = new_draft_id
+
+        kept = []
+        dropped = []
+
+        # ── 5. Re-add original items, skipping removed ones ──────────────────
+        for item in existing_items:
+            pname_lower = (item.product_name or "").lower()
+            if any(r in pname_lower for r in remove_lower):
+                dropped.append(item.product_name or item.product_id)
+                continue
+            try:
+                await mcps.billing.add_item_to_draft(
+                    draft_bill_id=new_draft_id,
+                    product_id=item.product_id,
+                    quantity=item.quantity,
+                )
+                kept.append(item.product_name)
+            except Exception:
+                pass  # skip deleted/unavailable products
+
+        # ── 6. Add new items ─────────────────────────────────────────────────
+        added = []
+        failed_adds = []
+        for new_item in adds:
+            pname = new_item.get("product_name", "")
+            qty = float(new_item.get("quantity", 1))
+            # Search catalogue — returns list[ProductResult] directly
+            search_result = await mcps.catalogue.search_products(
+                store_id=store_id, query=pname
+            )
+            if not search_result:
+                failed_adds.append(pname)
+                continue
+            product = search_result[0]
+            try:
+                await mcps.billing.add_item_to_draft(
+                    draft_bill_id=new_draft_id,
+                    product_id=product.product_id,
+                    quantity=qty,
+                )
+                added.append(f"{product.name} x{qty}")
+            except Exception as e:
+                failed_adds.append(f"{pname} (error: {e})")
+
+        # ── 7. Finalize with same payment mode ───────────────────────────────
+        try:
+            finalized = await mcps.billing.finalize_bill(
+                draft_bill_id=new_draft_id,
+                payment_mode=original_payment_mode,
+                telegram_user_id=tuid,
+            )
+        except Exception as e:
+            _draft_id_cell[0] = None
+            return f"ERROR: Could not finalize the amended bill: {e}"
+
+        _draft_id_cell[0] = None
+        _bill_id_cell[0] = finalized.bill_id
+
+        # Build summary
+        parts = []
+        if dropped:
+            parts.append(f"Removed: {', '.join(dropped)}")
+        if added:
+            parts.append(f"Added: {', '.join(added)}")
+        if failed_adds:
+            parts.append(f"Could not add (not in catalogue): {', '.join(failed_adds)}")
+
+        changes = " | ".join(parts) if parts else "No changes made."
+        return (
+            f"✅ Bill amended. {changes}\n"
+            f"bill_number={finalized.bill_number}\n"
+            f"status=PENDING_PAYMENT\n"
+            f"total=₹{finalized.total_amount:.2f} | payment_mode={original_payment_mode}\n"
+            f"Bill recreated. Now ask the owner: 'Updated bill total is ₹{finalized.total_amount:.2f}. "
+            f"How much did the customer pay?'\n"
+            f"⚠️ STOP — wait for the owner to state the paid amount, then call confirm_payment()."
+        )
+
     async def cancel_bill() -> str:
         """
         Cancel the current PENDING_PAYMENT bill before payment is confirmed.
@@ -2631,9 +3088,12 @@ def _build_active_tools(
 
     async def get_customer(name_or_phone: str) -> str:
         """Look up a customer by name or phone."""
-        result = await mcps.khata.get_customer(
-            store_id=store_id, name_or_phone=name_or_phone
-        )
+        for _variant in _possessive_variants(name_or_phone):
+            result = await mcps.khata.get_customer(
+                store_id=store_id, name_or_phone=_variant
+            )
+            if result.found:
+                break
         if not result.found:
             return f"No customer found matching '{name_or_phone}'."
         if len(result.customers) == 1:
@@ -2644,13 +3104,12 @@ def _build_active_tools(
                 f"balance={bal} | owes={owes}"
             )
         lines = [
-            f"Multiple customers found for '{name_or_phone}':",
-            "| Name | Phone | Balance | Owes | customer_id |",
-            "|------|-------|---------|------|-------------|",
+            f"Multiple customers found for '{name_or_phone}' "
+            f"[internal — customer_ids below are for tool calls only, NEVER show to owner]:",
         ]
-        for c in result.customers:
+        for i, c in enumerate(result.customers, 1):
             bal, owes = _balance_cols(c.current_balance)
-            lines.append(f"| {c.name} | {c.phone} | {bal} | {owes} | {c.customer_id} |")
+            lines.append(f"  {i}. [internal customer_id={c.customer_id}] {c.name} ({c.phone}) — {bal} ({owes})")
         return "\n".join(lines)
 
     async def add_credit_entry(customer_id: str, amount: float | None = None, notes: str | None = None) -> str:
@@ -3019,20 +3478,33 @@ def _build_active_tools(
         Add a new product to the catalogue during billing when it is not found by search_products.
         Use this ONLY when search_products returns no results for the product.
 
-        ⚠️ STOP — before calling this tool you MUST ask the owner ONE question collecting
-        ALL of the following that are not already known:
-          • Is it loose (sold by weight/volume) or branded/packaged?
-          • Brand name (e.g. "Lays", "Tata", "Amul") — or confirm no brand for loose items
-          • Unit: KG / L / PIECE / PACKET / DOZEN / BUNDLE / BAG / BOX / BOTTLE
-          • Cost price (what the shop paid per unit)
-          • MRP / selling price per unit
-          • GST rate: 0 for loose items; 5 / 12 / 18 / 28 for branded — NEVER guess
-          • Reorder level (minimum stock before alert)
-          • Initial stock quantity (how many units the shop has right now)
+        ⚠️ STOP — before calling this tool you MUST collect ALL missing fields from the owner.
+        Use EXACTLY the copyable template below — DO NOT use a plain numbered list or bullet list.
+        The template MUST be inside a fenced code block (triple backticks ```) so the owner
+        can tap Copy on Telegram, edit the values in-place, and send it back.
 
-        NEVER call this tool with assumed or guessed values for any of the above.
-        ⚠️ SAME TURN RULE: once you have ALL fields including initial stock quantity,
-        call add_product() AND receive_stock() in the SAME turn — do NOT split across turns.
+        ❌ WRONG (a plain numbered list — owner cannot copy-edit this):
+          1. Is it loose or packaged/branded?
+          2. Unit – choose one: KG, G, ...
+          3. Cost price ...
+
+        ✅ RIGHT — send EXACTLY this, nothing else (pre-fill the product name the owner requested):
+        ```
+        1. Name - Salt
+        2. Type - Branded / Loose
+        3. Unit - PIECE / KG / G / L / ML / PACKET / DOZEN / BUNDLE
+        4. Cost price (Rs.) - 10
+        5. Selling price / MRP (Rs.) - 15
+        6. GST rate - 5  (0 for loose, else 5 / 12 / 18 / 28 for branded)
+        7. Brand - Company Name (skip if loose)
+        8. Reorder level - 20
+        9. Initial stock - 50
+        ```
+
+        NEVER call this tool with assumed or guessed values for any field.
+        NEVER ask for description, category, or HSN code.
+        ⚠️ SAME TURN RULE: once you have ALL 9 fields, call add_product() AND receive_stock()
+        in the SAME turn — do NOT split across turns.
         The product_id is saved server-side — receive_stock() resolves it automatically.
         """
         from src.mcp.catalogue.models import AddProductResult
@@ -3079,6 +3551,7 @@ def _build_active_tools(
     if intent == "BILLING_CONFIRM":
         return [
             search_products,
+            amend_pending_bill,
             collect_balance_now, confirm_payment, cancel_bill, void_bill, void_bill_by_number, change_payment_mode,
             get_bill,
             add_customer, get_customer, add_credit_entry, add_payment_entry,
@@ -3095,6 +3568,7 @@ def _build_active_tools(
         add_customer, get_customer, add_credit_entry, add_payment_entry,
         add_product, receive_stock,
         list_customers_with_balances,
+        update_store,
     ]
 
 
@@ -3153,6 +3627,11 @@ INTENT_KEYWORDS: dict[str, list[str]] = {
         "void bill", "void the bill", "cancel bill", "cancel the bill", "cancel",
         "undo bill", "reverse bill", "undo", "void", "payment received",
         "paid", "yes paid", "payment done",
+        # Bill item amendment on a PENDING_PAYMENT bill
+        "drop ", "remove item", "remove from bill", "take off", "delete item",
+        "add to bill", "add item to bill", "add more to bill", "include in bill",
+        "change item", "replace item", "update bill item", "amend bill",
+        "wrong item", "wrong items", "change the bill",
         # Post-payment underpayment / overpayment resolution phrases.
         # These MUST route to BILLING_CONFIRM (not KHATA) so the Redis-aware
         # add_credit_entry / add_payment_entry with payment recording is used.
@@ -3171,9 +3650,24 @@ INTENT_KEYWORDS: dict[str, list[str]] = {
         "get bill", "fetch bill", "show bill details", "bill details",
     ],
     "CATALOGUE":  [
-        "catalogue", "add product", "add item", "new product", "new item",
+        "catalogue", "list catalogue", "show catalogue", "view catalogue",
+        "add product", "add item", "new product", "new item",
         "brand", "gst rate", "hsn", "mrp", "cost price", "reorder level",
         "edit product", "update product", "remove product",
+        # Store/shop profile settings — update_store, update_owner_name, get_store_details
+        "store details", "shop details", "store info", "shop info",
+        "store name", "shop name", "store phone", "shop phone",
+        "store address", "shop address", "update store", "update shop",
+        "change store", "change shop", "store gstin", "shop gstin",
+        "payment mode", "default payment", "owner name", "my name",
+        "firstname", "first name", "lastname", "last name",
+        "update name", "change name", "update profile", "change profile",
+        "update owner", "change owner",
+        # Default payment mode preference phrases
+        "always assume", "always use cash", "always use upi", "always use credit",
+        "default to cash", "default to upi", "default to credit",
+        "assume cash", "assume upi", "assume credit",
+        "set default payment", "change default payment", "set payment mode",
     ],
     "INVENTORY":  [
         "stock", "inventory", "restock", "low stock", "out of stock",
@@ -3182,6 +3676,8 @@ INTENT_KEYWORDS: dict[str, list[str]] = {
         "received stock", "add stock", "how much stock",
         "units left", "units available", "in stock",
         "full report", "all stock", "stock report",
+        "running out", "running low", "reorder", "re-order",
+        "need to reorder", "need reordering", "below reorder",
     ],
     "KHATA":      [
         "khata", "udhar", "customer balance",
@@ -3200,6 +3696,12 @@ INTENT_KEYWORDS: dict[str, list[str]] = {
         "invoice", "generate invoice", "send invoice", "list bills",
         "bills today", "bills for today", "bills on", "show bills",
         "weekly report", "monthly report", "analysis deck",
+        # Sales overview / today's sales — previously fell through to BILLING
+        "sales overview", "overview", "today sales", "today's sales",
+        "sales today", "how much did i sell", "how much i sold",
+        "how much was sold", "total sales", "total revenue",
+        "daily report", "day report", "today report", "summary today",
+        "overview today", "today overview", "today summary",
     ],
 }
 
@@ -3211,6 +3713,55 @@ _BILLING_PAYMENT_WORDS = frozenset({
 })
 
 _PAID_PATTERN = _re.compile(r"\bpaid\b.*?\d|[\w]+ paid\b", _re.IGNORECASE)
+
+# Normalises a customer name passed to lookup tools.
+# Handles possessive forms so "pavans" and "pavan's" both find "Pavan".
+#
+# Two-pass strategy used at call sites (see _customer_lookup_with_fallback):
+#   Pass 1 — try the name as-is
+#   Pass 2 — if not found, try with apostrophe-possessive ("'s") stripped
+#   Pass 3 — if still not found, try with bare trailing "s" stripped (min 4-char result)
+# This avoids pre-mangling real names like "James" or "Thomas".
+#
+_POSSESSIVE_APOS_RE = _re.compile(r"'s$", _re.IGNORECASE)
+
+
+def _possessive_variants(name: str) -> list[str]:
+    """
+    Return a list of name variants to try in order for customer lookup.
+    First entry is always the original (or apostrophe-stripped); subsequent
+    entries are fallbacks with trailing 's' removed.
+    Phone numbers return a single-element list unchanged.
+    """
+    stripped = name.strip()
+    if stripped.replace(" ", "").isdigit():
+        return [stripped]
+
+    variants: list[str] = []
+
+    # Always try apostrophe-possessive stripped first ("pavan's" → "pavan")
+    apos_stripped = _POSSESSIVE_APOS_RE.sub("", stripped).strip()
+    if apos_stripped != stripped:
+        # Had an apostrophe possessive — that's the canonical form; only one try needed
+        return [apos_stripped]
+
+    # No apostrophe: try original first, then with trailing 's' removed
+    variants.append(stripped)
+    if stripped.lower().endswith("s") and len(stripped[:-1]) >= 4:
+        variants.append(stripped[:-1].strip())
+    return variants
+
+# Matches a bare 10-digit Indian phone number anywhere in the message.
+# Used to keep "add to <name> - <phone>" messages in BILLING_CONFIRM when no draft
+# is active — these are always overpayment/underpayment customer-resolution replies.
+_PHONE_PATTERN = _re.compile(r"\b[6-9]\d{9}\b")
+
+# Matches "add to <name>" with no product/item context — signals a khata/payment
+# resolution reply (e.g. "add to Prakash - 7723197822") not a billing add-item.
+_ADD_TO_NAME_PATTERN = _re.compile(
+    r"\badd\s+to\s+[A-Za-z]",
+    _re.IGNORECASE,
+)
 
 # Matches "change/switch/modify/update ... cash/upi/mode" or "use/pay ... cash/upi ... instead"
 # Used by detect_intent to route payment-mode-change requests to BILLING_CONFIRM.
@@ -3253,6 +3804,12 @@ _BILLING_CONFIRM_FOLLOWUP_PHRASES = (
     "how much did they pay",
     "bill total is",
     "how much was paid",
+    "did the customer pay",
+    "how much via",
+    "customer pay via",
+    "pay via upi",
+    "pay via cash",
+    "customer paid via",
 )
 
 
@@ -3347,28 +3904,46 @@ def detect_intent(
 
     # BILLING_CONFIRM handles two kinds of requests:
     #   (a) Payment/cancellation actions — only when no draft is active
-    #       (so "paid", "cancel", "void" mid-draft stay in BILLING)
-    #   (b) Bill lookup/PDF actions — safe to route even with a draft active
-    #       (looking up a past bill doesn't touch the current draft)
-    _BILLING_CONFIRM_LOOKUP_KEYWORDS = frozenset({
-        "list all bill", "list bill", "show bill", "bills for",
-        "all bill", "bill history", "purchase history", "purchases for",
+    #   (b) Bill lookup/PDF actions — split into two groups:
+    #       - DRAFT-SAFE lookups: always route to BILLING_CONFIRM (historical/dated queries,
+    #         PDF generation, customer lists — none of these refer to the current draft)
+    #       - DRAFT-SENSITIVE lookups: "list bill", "show bill", "bill details", "get bill" —
+    #         when a draft is active, these mean "show my current draft" → route to BILLING
+    #         so get_draft_bill is available.
+
+    # Keywords that are genuinely safe to route to BILLING_CONFIRM regardless of draft state:
+    # they all refer to historical/dated bills, PDFs, or customer balance lists.
+    _BILLING_CONFIRM_LOOKUP_SAFE = frozenset({
+        # Date-scoped historical bills
+        "bills for", "bill history", "purchase history", "purchases for",
         "bought by", "list purchase",
-        # Date-based bill listing
         "bill on", "bills on", "bills today", "bills for today",
+        "todays bills", "today's bills", "today bill", "view today",
+        "bills yesterday", "yesterdays bills", "yesterday's bills", "yesterday bill", "view yesterday",
         "bills for tomorrow", "list bill on", "show bill on",
         "bills this week", "bills last week",
-        # Invoice / PDF generation
+        "list all bill", "all bill",
+        # Invoice / PDF generation for a named/dated bill
         "generate bill", "print bill", "share bill", "bill pdf",
         "send bill", "pdf for", "pdf of", "invoice pdf",
         "send invoice", "generate invoice", "invoice for",
-        "get bill", "fetch bill", "show bill details", "bill details",
         # All-customer khata / balance listing
         "all khata", "all balances", "all balance", "list all khata",
         "all customers", "list customers", "show all customers",
         "who owes", "list khata", "show khata", "khata list",
         "outstanding balances", "all outstanding",
     })
+    # Keywords that are DRAFT-SENSITIVE: with an active draft they mean "show current draft"
+    # → must route to BILLING (get_draft_bill lives there); only route to BILLING_CONFIRM
+    # when no draft is active (they then refer to the last confirmed bill or a named bill).
+    _BILLING_CONFIRM_LOOKUP_DRAFT_SENSITIVE = frozenset({
+        "list bill", "show bill",
+        "get bill", "fetch bill", "show bill details", "bill details",
+        "bill items", "show items", "list items",
+        "bill summary", "view bill", "current bill",
+        "show current bill", "what is on the bill", "what did i add",
+    })
+
     # Post-payment resolution: underpayment/overpayment answers that must ALWAYS
     # route to BILLING_CONFIRM so the Redis-aware tools with payment recording are used.
     # These are safe to route regardless of draft state — they are always follow-ups
@@ -3388,9 +3963,12 @@ def detect_intent(
         "balance paid", "paid balance", "paid the rest", "paid remaining",
         "full amount paid", "paid full", "paid in full",
     })
-    # Lookup keywords are safe regardless of draft state (looking up a bill
-    # doesn't touch the current draft).
-    if any(kw in msg for kw in _BILLING_CONFIRM_LOOKUP_KEYWORDS):
+
+    # Always safe to route to BILLING_CONFIRM regardless of draft state
+    if any(kw in msg for kw in _BILLING_CONFIRM_LOOKUP_SAFE):
+        return "BILLING_CONFIRM"
+    # Draft-sensitive: only route to BILLING_CONFIRM when no draft is open
+    if not has_active_draft and any(kw in msg for kw in _BILLING_CONFIRM_LOOKUP_DRAFT_SENSITIVE):
         return "BILLING_CONFIRM"
     # Fuzzy match: "list/show/all + balance(s)/khata/khta/udhar" — catches typos
     # like "list ass khta balances" or "all khata" that miss exact keyword matching.
@@ -3411,6 +3989,15 @@ def detect_intent(
         # Guard: only when no draft active — mid-draft "add to khata" means
         # "finalise as credit" → must stay in BILLING for finalize_bill.
         if _re.search(r"\bkhata\b", msg):
+            return "BILLING_CONFIRM"
+        # "add to <Name>" with a phone number — always an overpayment/underpayment
+        # customer-resolution reply. Route to BILLING_CONFIRM so add_payment_entry /
+        # add_credit_entry with Redis payment recording are available.
+        if _ADD_TO_NAME_PATTERN.search(user_message) and _PHONE_PATTERN.search(user_message):
+            return "BILLING_CONFIRM"
+        # Bare 10-digit phone number — always a customer-name/phone resolution follow-up
+        # (overpayment or underpayment flow) when no draft is active.
+        if _PHONE_PATTERN.search(user_message) and not _re.search(r"\b(bill|item|product|stock|inventory)\b", msg):
             return "BILLING_CONFIRM"
 
     # Payment/cancellation keywords — only when no active draft

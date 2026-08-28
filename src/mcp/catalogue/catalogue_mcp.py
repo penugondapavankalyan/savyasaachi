@@ -447,18 +447,27 @@ class CatalogueMCP:
                 if results:
                     break
 
-        # Cross-field pass for multi-word queries (e.g. "natraj pencils"):
+        # Cross-field pass for multi-word queries (e.g. "natraj pencils", "wheat aata"):
         # Stem each individual word so "pencils" → "pencil" before the ilike.
-        # Try each word as a name match, then verify in-memory that at least
-        # one of the remaining words appears in the brand field.
-        # Catches: name="Pencil", brand="Natraj" from query "natraj pencils".
+        # Try each word as a name match and collect ALL name hits — do NOT filter
+        # by whether the remaining words appear in the brand field.
+        #
+        # Rationale: the old brand-check was too strict —
+        #   "wheat aata" → name ILIKE '%wheat%' finds "Wheat Aaata" but then
+        #   drops it because "aata" ∉ brand "Aashirvaad" → zero results.
+        #   "nataraj pencil" (typo) → name ILIKE '%pencil%' finds both Natraj
+        #   and Apsara, but drops Natraj because "nataraj" ∉ "natraj" (substring
+        #   miss on the typo) → zero results.
+        #
+        # New behaviour: return ALL rows whose name matches any word from the
+        # query. If multiple products match (e.g. Natraj Pencil + Apsara Pencil),
+        # the agent shows them to the owner and asks which one — same as a plain
+        # single-word search returning multiple results.
         if not results:
-            # Use stemmed individual words so plural forms match singular names
             raw_words = q_lower.split()
             words = [_stem_word(w) for w in raw_words]
             if len(words) > 1:
                 for i, name_word in enumerate(words):
-                    other_words = [w for j, w in enumerate(words) if j != i]
                     resp3 = (
                         _base_q()
                         .ilike("name", f"%{name_word}%")
@@ -468,10 +477,8 @@ class CatalogueMCP:
                     for row in (resp3.data or []):
                         if row["id"] in seen_ids:
                             continue
-                        brand_val = (row.get("brand") or "").lower()
-                        if any(w in brand_val for w in other_words):
-                            seen_ids.add(row["id"])
-                            results.append(row)
+                        seen_ids.add(row["id"])
+                        results.append(row)
                     if results:
                         break
 

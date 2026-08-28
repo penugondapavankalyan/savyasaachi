@@ -27,6 +27,8 @@ class StoreContext(BaseModel):
     owner_first_name: Optional[str] = None
     owner_last_name: Optional[str] = None
     gstin: Optional[str] = None
+    phone: Optional[str] = None
+    address: Optional[str] = None
     state_code: str = "29"
     state_name: str = "Karnataka"
     default_payment_mode: str = "CASH"
