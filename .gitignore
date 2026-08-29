@@ -218,9 +218,8 @@ __marimo__/
 .streamlit/secrets.toml
 
 
-.env.example
+
 .bob/
-run_local.py
 kirana_agent.pdf
 local_output/
 package/
