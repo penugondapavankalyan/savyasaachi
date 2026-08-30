@@ -110,10 +110,21 @@ def _build_unregistered_tools(mcps: MCPInstances, tuid: int) -> list[Callable]:
         """
         Create the shop for the owner. Call this ONLY after:
         1. The owner has confirmed their name (save_owner_name was called).
-        2. ALL 6 shop details have been collected AND the owner confirmed the summary.
+        2. ALL 6 shop details have been collected ONE FIELD AT A TIME (see sequence below).
+        3. You showed the owner the full summary and they confirmed with 'yes' or 'save'.
 
-        DO NOT call this tool until the owner explicitly says 'yes' or 'save' to the
-        summary you showed them. NEVER skip the confirmation step.
+        COLLECTION SEQUENCE — strictly one field per turn, no batching:
+          Turn A: receive shop name  → next turn ask ONLY for phone
+          Turn B: receive phone      → next turn ask ONLY for state code
+          Turn C: receive state code → next turn ask ONLY for GSTIN
+          Turn D: receive GSTIN      → next turn ask ONLY for address
+          Turn E: receive address    → next turn ask ONLY for payment mode
+          Turn F: receive payment mode → show summary + 'Shall I save? (yes/no)' — nothing else
+          Turn G: owner says yes     → call setup_store() NOW
+
+        ⚠️ NEVER ask for two or more fields in a single message.
+        ⚠️ NEVER show a numbered list of remaining fields — ask for ONE, wait for the answer, then ask the next.
+        ⚠️ DO NOT call this tool until the owner explicitly says 'yes' or 'save' to the summary.
 
         Parameters:
         - shop_name: name of the shop (required)
@@ -122,7 +133,7 @@ def _build_unregistered_tools(mcps: MCPInstances, tuid: int) -> list[Callable]:
         - gstin: 15-character GST registration number (optional — pass None if owner said 'skip')
         - address: shop address (optional — pass None if owner said 'skip')
         - default_payment_mode: CASH / UPI / CREDIT.
-          Ask the owner which mode they prefer. If they don't specify, use 'CASH' and inform them:
+          If the owner did not specify, use 'CASH' and tell them:
           'No payment mode specified — setting Cash as the default. You can change this later.'
         Returns confirmation with store details.
         """
@@ -722,17 +733,23 @@ def _build_active_tools(
         )
         if not products:
             return "Catalogue is empty."
-        lines = [
-            "Catalogue "
-            "[internal — product_ids below are for tool calls only, NEVER show to owner]:"
+        display_lines = []
+        internal_lines = [
+            "[internal product_ids — for tool calls only, NEVER copy these into your reply to the owner]:"
         ]
         for p in products:
             brand_str = f" ({p.brand})" if p.brand else ""
             loose_str = "LOOSE" if p.is_loose else "BRANDED"
-            lines.append(
-                f"  [internal product_id={p.product_id}] {p.name}{brand_str} | {loose_str} | {p.unit} | MRP Rs.{p.mrp} | GST {p.gst_rate}%"
+            display_lines.append(
+                f"{p.name}{brand_str} | {loose_str} | {p.unit} | MRP Rs.{p.mrp} | GST {p.gst_rate}%"
             )
-        return "\n".join(lines)
+            internal_lines.append(
+                f"  [internal product_id={p.product_id} for {p.name}{brand_str}]"
+            )
+        return (
+            "Catalogue:\n" + "\n".join(display_lines)
+            + "\n\n" + "\n".join(internal_lines)
+        )
 
     async def update_store(
         shop_name: str | None = None, phone: str | None = None,
@@ -1287,7 +1304,8 @@ def _build_active_tools(
             return "```\n" + "\n".join(lines) + "\n```"
 
         return [search_products, receive_stock, get_stock, get_all_stock,
-                check_availability, get_low_stock_items, get_stock_movements]
+                check_availability, get_low_stock_items, get_stock_movements,
+                update_store, update_owner_name]
 
     # ── KHATA intent ─────────────────────────────────────────────────────
 
@@ -1521,7 +1539,7 @@ def _build_active_tools(
 
         return [search_products, add_customer, get_customer, add_credit_entry,
                 add_payment_entry, get_balance, get_khata_history, list_customers_with_balances,
-                get_payment_history]
+                get_payment_history, update_store, update_owner_name]
 
     # ── ANALYTICS intent ─────────────────────────────────────────────────
 
@@ -1682,7 +1700,8 @@ def _build_active_tools(
         # generate_invoice_pdf, list_bills_for_customer, get_bills_by_date are shared closures defined above
         return [search_products, get_daily_summary, get_sales_trend,
                 get_top_items, get_gst_summary, get_low_stock_items,
-                get_bills_by_date, generate_invoice_pdf, generate_analysis_pptx]
+                get_bills_by_date, generate_invoice_pdf, generate_analysis_pptx,
+                update_store, update_owner_name]
 
     # ── BILLING — default ACTIVE group (most common daily use) ───────────
 
@@ -3557,6 +3576,7 @@ def _build_active_tools(
             add_customer, get_customer, add_credit_entry, add_payment_entry,
             get_payment_history, list_bills_for_customer, get_bills_by_date, generate_invoice_pdf,
             list_customers_with_balances,
+            update_store, update_owner_name,
         ]
 
     # ── BILLING (default) — draft-building tools ──────────────────────────────

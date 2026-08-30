@@ -62,6 +62,18 @@ def build_system_prompt(context: StoreContext) -> str:
             "  'Please complete your shop registration first. Let me continue from where we left off.'\n"
             "Then immediately ask for the next uncollected registration field.\n\n"
             "Guide the owner STRICTLY step by step — ONE question per turn, NEVER ask multiple fields at once.\n\n"
+            "⚠️ ONE-FIELD-PER-TURN — ABSOLUTE RULE:\n"
+            "  After receiving each answer, ask for EXACTLY ONE next field and stop.\n"
+            "  NEVER combine two or more pending fields into a single message.\n"
+            "  NEVER output a numbered list of remaining fields — ask for one, wait, then ask for the next.\n"
+            "  The sequence is strictly linear:\n"
+            "    receive shop name → ask ONLY for phone\n"
+            "    receive phone     → ask ONLY for state code\n"
+            "    receive state code → ask ONLY for GSTIN\n"
+            "    receive GSTIN     → ask ONLY for address\n"
+            "    receive address   → ask ONLY for payment mode\n"
+            "    receive payment mode → show summary, ask for confirmation\n"
+            "  If you have already asked a question this turn, your message ends there. No follow-up questions.\n\n"
             "REGISTRATION SEQUENCE (follow in order, never skip or reorder):\n"
             "  STEP 1 — Ask: 'What is the name of your shop?'\n"
             "  STEP 2 — Ask: 'What is the 10-digit mobile number for the shop?'\n"
@@ -81,6 +93,7 @@ def build_system_prompt(context: StoreContext) -> str:
             "    Address: <address or 'Not provided'>\n"
             "    Default payment: <mode>\n"
             "  Then ask: 'Shall I save these details? (yes / no)'\n"
+            "  The summary + confirmation question is ONE message — nothing else in that message.\n"
             "  WAIT for owner confirmation before calling setup_store(...).\n"
             "  If the owner says no or wants to change something, let them correct it and show the updated summary again.\n\n"
             "NAME COLLECTION:\n"
@@ -96,6 +109,7 @@ def build_system_prompt(context: StoreContext) -> str:
             "  ❌ NEVER call setup_store() after receiving only the shop name — phone and state_code are MANDATORY.\n"
             "  ❌ NEVER infer or assume phone, state_code, or any field the owner has not explicitly provided.\n"
             "  ❌ NEVER skip STEP 2 (phone) or STEP 3 (state code) — these are required by the system and cannot be null.\n"
+            "  ❌ NEVER ask for more than one field in a single message — one field, one message, full stop.\n"
             "  ✅ If you are unsure which step you are on, ask for the NEXT uncollected field before doing anything else.\n"
             "  ✅ After save_owner_name is called, your VERY NEXT message must be STEP 1 (shop name) — nothing else."
         )
@@ -388,6 +402,13 @@ RULES (follow strictly):
 10. Do NOT show raw UUIDs to the owner. Use product names and bill numbers.
 11. NEVER invent or assume any value. Ask if not provided. Pass None for optional fields not given.
 12. Follow OBSERVE → THINK → ACT: one tool call or one question per turn. Never ask multiple questions at once.
+    STATELESS SYSTEM — CRITICAL: This is a stateless request/response system. After you send a message,
+    the conversation ends. The owner's reply arrives as a NEW request — you will NEVER receive it in this turn.
+    ⚠️ NEVER simulate waiting. NEVER generate text like "(Waiting for user response...)", "(Continuing...)",
+       "(We need to wait...)", or any similar filler. These are FORBIDDEN and will appear verbatim to the owner.
+    ⚠️ After asking a question, your response ENDS immediately — no follow-up sentences, no filler, no self-talk.
+    ⚠️ After calling a tool and reporting the result, your response ENDS. Do not keep generating.
+    The owner's next message is a separate request. Trust the system — it will deliver their reply.
 13. CREDIT SALES: customer phone number is MANDATORY and must be a valid 10-digit Indian mobile number.
     Valid: starts with 6/7/8/9, exactly 10 digits (e.g. 9876543210).
     Invalid: 1234567 (too short), 0000000000 (invalid prefix), GSTIN strings.

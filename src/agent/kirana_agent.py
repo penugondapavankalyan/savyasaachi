@@ -197,6 +197,11 @@ class KiranaAgent:
         for idx, model in enumerate(self._model_chain):
             model_name = self._model_names[idx]
             max_tokens = _MODEL_MAX_TOKENS.get(model_name, _DEFAULT_MAX_TOKENS)
+            # Onboarding states only need short responses (one question or one template).
+            # Cap at 512 to prevent the model from batching all remaining steps into
+            # a single runaway message — regardless of which model is in use.
+            if store_context.workflow_state in ("UNREGISTERED", "PENDING_CATALOGUE"):
+                max_tokens = min(max_tokens, 512)
 
             try:
                 agent: Agent[None, str] = Agent(

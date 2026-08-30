@@ -228,7 +228,7 @@ _PENDING_CATALOGUE_BLOCK_RE = re.compile(
     r"\b(bill|billing|invoice|make bill|create bill|"
     r"khata|udhar|payment|pay|credit sale|balance|customer|"
     r"report|analytics|sales|revenue|gst report|"
-    r"stock movement|receive stock|reorder)\b",
+    r"stock movement|receive stock)\b",
     re.IGNORECASE,
 )
 
