@@ -212,7 +212,7 @@ class Settings:
     # ---- Tuning ----
     @property
     def MAX_HISTORY_MESSAGES(self) -> int:
-        return int(_optional("MAX_HISTORY_MESSAGES", "10"))
+        return int(_optional("MAX_HISTORY_MESSAGES", "20"))
 
     @property
     def DRAFT_BILL_TTL_HOURS(self) -> int:
